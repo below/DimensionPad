@@ -14,51 +14,41 @@ pad.$connected
     }
     .store(in: &cancellables)
 
-// Observe pad state and emit event-like messages
-var previous = pad.pads
-pad.$pads
-    .sink { current in
-        for p in [UInt8]([1, 2, 3]) {
-            let old = previous[p] ?? (false, nil)
-            let new = current[p] ?? (false, nil)
-
-            if !old.present && new.present {
-                Task {
-                    do {
-                        let info = try await pad.readTagInfo(padByte: p)
-                        switch info.type {
-                        case .character:
-                            let character = DimensionPadMetadata.getCharacterById(info.id)
-                            let name = character?.name ?? String(info.id)
-                            let world = character?.world ?? "Unknown"
-                            print("Character: \(name) (\(world)) added to panel \(p) (\(info.signature))")
-                            activeAssignments[info.signature] = (type: "Character", name: name, world: world)
-                        case .vehicle:
-                            let vehicle = DimensionPadMetadata.getVehicleById(info.id)
-                            let name = vehicle?.name ?? String(info.id)
-                            let world = vehicle?.world ?? "Unknown"
-                            print("Vehicle: \(name) (\(world)) added to panel \(p) (\(info.signature))")
-                            activeAssignments[info.signature] = (type: "Vehicle", name: name, world: world)
-                        case .unknown:
-                            print("Tag: \(info.id) added to panel \(p) (\(info.signature))")
-                        }
-                    } catch {
-                        print("Tag read failed on panel \(p): \(error)")
+pad.events
+    .sink { event in
+        switch event.action {
+        case .add:
+            Task {
+                do {
+                    let info = try await pad.readTagInfo(padByte: event.pad)
+                    switch info.type {
+                    case .character:
+                        let character = DimensionPadMetadata.getCharacterById(info.id)
+                        let name = character?.name ?? String(info.id)
+                        let world = character?.world ?? "Unknown"
+                        print("Character: \(name) (\(world)) added to panel \(event.pad) (\(info.signature))")
+                        activeAssignments[info.signature] = (type: "Character", name: name, world: world)
+                    case .vehicle:
+                        let vehicle = DimensionPadMetadata.getVehicleById(info.id)
+                        let name = vehicle?.name ?? String(info.id)
+                        let world = vehicle?.world ?? "Unknown"
+                        print("Vehicle: \(name) (\(world)) added to panel \(event.pad) (\(info.signature))")
+                        activeAssignments[info.signature] = (type: "Vehicle", name: name, world: world)
+                    case .unknown:
+                        print("Tag: \(info.id) added to panel \(event.pad) (\(info.signature))")
                     }
+                } catch {
+                    print("Tag read failed on panel \(event.pad): \(error)")
                 }
-            } else if old.present && !new.present {
-                if let signature = old.uid, let info = activeAssignments[signature] {
-                    print("\(info.type): \(info.name) (\(info.world)) removed from panel \(p) (\(signature))")
-                } else if let signature = old.uid {
-                    print("Tag removed from panel \(p) (\(signature))")
-                } else {
-                    print("Tag removed from panel \(p)")
-                }
-            } else if old.present && new.present && old.uid != new.uid {
-                print("swap: pad \(p) uid=\(new.uid ?? "?")")
             }
+        case .remove:
+            if let info = activeAssignments[event.signature] {
+                print("\(info.type): \(info.name) (\(info.world)) removed from panel \(event.pad) (\(event.signature))")
+            } else {
+                print("Tag removed from panel \(event.pad) (\(event.signature))")
+            }
+            activeAssignments[event.signature] = nil
         }
-        previous = current
     }
     .store(in: &cancellables)
 

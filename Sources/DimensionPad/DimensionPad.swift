@@ -14,6 +14,17 @@ public struct TagInfo {
     public let signature: String
 }
 
+public struct TagEvent: Sendable {
+    public enum Action: Sendable {
+        case add
+        case remove
+    }
+
+    public let action: Action
+    public let pad: UInt8
+    public let signature: String
+}
+
 @MainActor
 public final class DimensionPad {
     @Published public private(set) var connected: Bool = false
@@ -22,6 +33,7 @@ public final class DimensionPad {
         2: (false, nil),
         3: (false, nil)
     ]
+    public let events = PassthroughSubject<TagEvent, Never>()
 
     enum ToyPadReadError: Error {
         case notConnected
@@ -210,14 +222,17 @@ public final class DimensionPad {
                 presentTagByPad[ev.pad] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
                 print("✅ \(padName(ev.pad)) inserted uid=\(signature)")
                 publishPad(ev.pad, present: true, uid: signature)
+                events.send(TagEvent(action: .add, pad: ev.pad, signature: signature))
             }
 
         case 1: // removed
             // Only log/publish if something was present
             if presentTagByPad[ev.pad] != nil {
+                let removedSignature = presentTagByPad[ev.pad]?.signature ?? ""
                 presentTagByPad[ev.pad] = nil
                 print("❌ \(padName(ev.pad)) removed")
                 publishPad(ev.pad, present: false, uid: nil)
+                events.send(TagEvent(action: .remove, pad: ev.pad, signature: removedSignature))
             }
 
         default:
