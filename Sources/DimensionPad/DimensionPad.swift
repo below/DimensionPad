@@ -37,6 +37,13 @@ public final class DimensionPad {
     ]
     public let events = PassthroughSubject<TagEvent, Never>()
 
+    public enum Pad: UInt8 {
+        case all = 0
+        case center = 1
+        case left = 2
+        case right = 3
+    }
+
     enum ToyPadReadError: Error {
         case notConnected
         case tagNotPresent
@@ -114,7 +121,33 @@ public final class DimensionPad {
         let r = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         print(r == kIOReturnSuccess ? "HID manager open ✅" : "HID manager open ❌ \(r)")
     }
-    
+ 
+    public func readTagInfo(padByte: UInt8) async throws -> TagInfo {
+        guard let tag = presentTagByPad[padByte] else { throw ToyPadReadError.tagNotPresent }
+        let block = try await readPages(padByte: padByte, startPage: 0x24)
+        guard block.count >= 16 else { throw ToyPadReadError.malformedResponse }
+
+        let payloadView = Array(block[8..<12])
+        let type = detectTagType(payloadView)
+        switch type {
+        case .vehicle:
+            let id = getVehicleId(block)
+            return TagInfo(type: .vehicle, id: id, signature: tag.signature)
+        case .character:
+            let encrypted = Array(block[0..<8])
+            let id = getCharacterId(uid: tag.uid, encrypted: encrypted)
+            return TagInfo(type: .character, id: id, signature: tag.signature)
+        case .unknown:
+            return TagInfo(type: .unknown, id: 0, signature: tag.signature)
+        }
+    }
+
+
+    public func color(pad: Pad, r: UInt8, g: UInt8, b: UInt8) {
+        guard let dev = self.device else { return }
+        switchPad(dev, pad: pad, r: r, g: g, b: b)
+    }
+
     private func publishPad(_ pad: UInt8, present: Bool, uid: String?) {
         pads[pad] = (present, uid)
     }
@@ -336,7 +369,7 @@ public final class DimensionPad {
         }
     }
     
-    public func readPages(padByte: UInt8, startPage: UInt8) async throws -> [UInt8] {
+    private func readPages(padByte: UInt8, startPage: UInt8) async throws -> [UInt8] {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
 
         guard let tag = presentTagByPad[padByte] else { throw ToyPadReadError.tagNotPresent }
@@ -356,26 +389,6 @@ public final class DimensionPad {
         return data16
     }
 
-    public func readTagInfo(padByte: UInt8) async throws -> TagInfo {
-        guard let tag = presentTagByPad[padByte] else { throw ToyPadReadError.tagNotPresent }
-        let block = try await readPages(padByte: padByte, startPage: 0x24)
-        guard block.count >= 16 else { throw ToyPadReadError.malformedResponse }
-
-        let payloadView = Array(block[8..<12])
-        let type = detectTagType(payloadView)
-        switch type {
-        case .vehicle:
-            let id = getVehicleId(block)
-            return TagInfo(type: .vehicle, id: id, signature: tag.signature)
-        case .character:
-            let encrypted = Array(block[0..<8])
-            let id = getCharacterId(uid: tag.uid, encrypted: encrypted)
-            return TagInfo(type: .character, id: id, signature: tag.signature)
-        case .unknown:
-            return TagInfo(type: .unknown, id: 0, signature: tag.signature)
-        }
-    }
-
     /// Send a 0x55 command frame and await the 0x55 response payload (without checksum).
     private func request55(kind: PendingKind, dev: IOHIDDevice, cmd: [UInt8], timeoutNs: UInt64 = 800_000_000) async throws -> [UInt8] {
         // cmd must already include the leading 0x55, length, opcode, msg, ...
@@ -393,6 +406,12 @@ public final class DimensionPad {
                 }
             }
         }
+    }
+
+    private func switchPad(_ dev: IOHIDDevice, pad: Pad, r: UInt8, g: UInt8, b: UInt8) {
+        // 0x55 0x06 0xC0 0x02 = "switch pad color"
+        // then: pad, R, G, B
+        sendCommand(dev, [0x55, 0x06, 0xC0, 0x02, pad.rawValue, r, g, b])
     }
 
     private func sendCommand(_ dev: IOHIDDevice, _ cmd: [UInt8]) {
