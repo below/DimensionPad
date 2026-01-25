@@ -23,6 +23,8 @@ public struct TagEvent: Sendable {
     public let action: Action
     public let pad: UInt8
     public let signature: String
+    public let index: UInt8
+    public let uid: [UInt8]
 }
 
 @MainActor
@@ -222,17 +224,16 @@ public final class DimensionPad {
                 presentTagByPad[ev.pad] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
                 print("✅ \(padName(ev.pad)) inserted uid=\(signature)")
                 publishPad(ev.pad, present: true, uid: signature)
-                events.send(TagEvent(action: .add, pad: ev.pad, signature: signature))
+                events.send(TagEvent(action: .add, pad: ev.pad, signature: signature, index: ev.index, uid: ev.uid))
             }
 
         case 1: // removed
             // Only log/publish if something was present
-            if presentTagByPad[ev.pad] != nil {
-                let removedSignature = presentTagByPad[ev.pad]?.signature ?? ""
+            if let removed = presentTagByPad[ev.pad] {
                 presentTagByPad[ev.pad] = nil
                 print("❌ \(padName(ev.pad)) removed")
                 publishPad(ev.pad, present: false, uid: nil)
-                events.send(TagEvent(action: .remove, pad: ev.pad, signature: removedSignature))
+                events.send(TagEvent(action: .remove, pad: ev.pad, signature: removed.signature, index: removed.index, uid: removed.uid))
             }
 
         default:

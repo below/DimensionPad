@@ -15,14 +15,20 @@ public struct VehicleMetadata: Codable, Sendable {
 }
 
 public enum DimensionPadMetadata {
-    private static let characters: [Int: CharacterMetadata] = {
+    private static let characterList: [CharacterMetadata] = {
         loadArray("minifigs", as: CharacterMetadata.self)
-            .reduce(into: [:]) { $0[$1.id] = $1 }
+    }()
+
+    private static let vehicleList: [VehicleMetadata] = {
+        loadArray("vehicles", as: VehicleMetadata.self)
+    }()
+
+    private static let characters: [Int: CharacterMetadata] = {
+        characterList.reduce(into: [:]) { $0[$1.id] = $1 }
     }()
 
     private static let vehicles: [Int: VehicleMetadata] = {
-        loadArray("vehicles", as: VehicleMetadata.self)
-            .reduce(into: [:]) { $0[$1.id] = $1 }
+        vehicleList.reduce(into: [:]) { $0[$1.id] = $1 }
     }()
 
     public static func getCharacterById(_ id: Int) -> CharacterMetadata? {
@@ -31,6 +37,14 @@ public enum DimensionPadMetadata {
 
     public static func getVehicleById(_ id: Int) -> VehicleMetadata? {
         vehicles[id]
+    }
+
+    public static func listCharacters() -> [CharacterMetadata] {
+        characterList
+    }
+
+    public static func listVehicles() -> [VehicleMetadata] {
+        vehicleList
     }
 
     private static func loadArray<T: Decodable>(_ name: String, as type: T.Type) -> [T] {
