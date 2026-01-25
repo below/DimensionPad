@@ -1,10 +1,23 @@
 import Foundation
+import Combine
 import IOKit.hid
 
+public enum TagType {
+    case character
+    case vehicle
+    case unknown
+}
+
+public struct TagInfo {
+    public let type: TagType
+    public let id: Int
+    public let signature: String
+}
+
 @MainActor
-final class DimensionPad {
-    @Published var connected: Bool = false
-    @Published var pads: [UInt8: (present: Bool, uid: String?)] = [
+public final class DimensionPad {
+    @Published public private(set) var connected: Bool = false
+    @Published public private(set) var pads: [UInt8: (present: Bool, uid: String?)] = [
         1: (false, nil),
         2: (false, nil),
         3: (false, nil)
@@ -12,6 +25,7 @@ final class DimensionPad {
 
     enum ToyPadReadError: Error {
         case notConnected
+        case tagNotPresent
         case timeout
         case malformedResponse
         case deviceError(status: UInt8)
@@ -34,7 +48,12 @@ final class DimensionPad {
     private var inputReport = [UInt8](repeating: 0, count: 32)
 
     internal var msgCounter: UInt8 = 0x01
-    
+    private func nextMsg() -> UInt8 {
+        let m = msgCounter
+        msgCounter &+= 1
+        return m
+    }
+
     internal enum PendingKind {
         case readPages
         case other
@@ -47,13 +66,19 @@ final class DimensionPad {
 
     internal var pending55: [UInt8: Pending55] = [:]
 
-    private var presentUIDByPad: [UInt8: String] = [:]
+    private struct PresentTag {
+        let uid: [UInt8]
+        let signature: String
+        let index: UInt8
+    }
 
-    init() {
+    private var presentTagByPad: [UInt8: PresentTag] = [:]
+
+    public init() {
         self.manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(0))
     }
     
-    func open() {
+    public func connect() {
         let matching: [String: Any] = [
             kIOHIDVendorIDKey as String: vendorID,
             kIOHIDProductIDKey as String: productID
@@ -86,7 +111,7 @@ final class DimensionPad {
         // New USB session → reset protocol state
         msgCounter = 0x00
         pending55.removeAll()
-        presentUIDByPad.removeAll()
+        presentTagByPad.removeAll()
         
         print("Device matched: \((IOHIDDeviceGetProperty(dev,  kIOHIDProductKey as CFString) as? String) ?? "-")")
 
@@ -168,7 +193,7 @@ final class DimensionPad {
         let pad = b[2]
         let index = b[4]          // 0,1,2  (slot)
         let action = b[5]
-        let uid = Array(b[7...13]) // 7 bytes
+        let uid = Array(b[6...12]) // 7 bytes
 
         print("TAG \(hex(b))")
 
@@ -176,21 +201,21 @@ final class DimensionPad {
     }
     
     private func handleTag(_ ev: TagEv) {
-        let uid = uidHex(ev.uid)
+        let signature = signatureString(ev.uid)
 
         switch ev.action {
         case 0: // inserted
             // Only log/publish if this is a new UID for that pad
-            if presentUIDByPad[ev.pad] != uid {
-                presentUIDByPad[ev.pad] = uid
-                print("✅ \(padName(ev.pad)) inserted uid=\(uid)")
-                publishPad(ev.pad, present: true, uid: uid)
+            if presentTagByPad[ev.pad]?.signature != signature {
+                presentTagByPad[ev.pad] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
+                print("✅ \(padName(ev.pad)) inserted uid=\(signature)")
+                publishPad(ev.pad, present: true, uid: signature)
             }
 
         case 1: // removed
             // Only log/publish if something was present
-            if presentUIDByPad[ev.pad] != nil {
-                presentUIDByPad[ev.pad] = nil
+            if presentTagByPad[ev.pad] != nil {
+                presentTagByPad[ev.pad] = nil
                 print("❌ \(padName(ev.pad)) removed")
                 publishPad(ev.pad, present: false, uid: nil)
             }
@@ -295,7 +320,96 @@ final class DimensionPad {
         }
     }
     
+    public func readPages(padByte: UInt8, startPage: UInt8) async throws -> [UInt8] {
+        guard let dev = self.device else { throw ToyPadReadError.notConnected }
 
+        guard let tag = presentTagByPad[padByte] else { throw ToyPadReadError.tagNotPresent }
+        let index = tag.index
+        let msg = nextMsg()
+        print("D2 READ msg=\(msg) pad=\(padByte) index=\(index) page=\(String(format:"%02X", startPage))")
+
+        // cmd: 55 04 D2 <msg> <index> <page>
+        let data16 = try await request55(
+            kind: .readPages,
+            dev: dev,
+            cmd: createReadTagCommand(msg: msg, index: index, page: startPage)
+        )
+
+        // handle55Response(.readPages) liefert bereits nur die 16 Datenbytes
+        guard data16.count == 16 else { throw ToyPadReadError.malformedResponse }
+        return data16
+    }
+
+    public func readTagInfo(padByte: UInt8) async throws -> TagInfo {
+        guard let tag = presentTagByPad[padByte] else { throw ToyPadReadError.tagNotPresent }
+        let block = try await readPages(padByte: padByte, startPage: 0x24)
+        guard block.count >= 16 else { throw ToyPadReadError.malformedResponse }
+
+        let payloadView = Array(block[8..<12])
+        let type = detectTagType(payloadView)
+        switch type {
+        case .vehicle:
+            let id = getVehicleId(block)
+            return TagInfo(type: .vehicle, id: id, signature: tag.signature)
+        case .character:
+            let encrypted = Array(block[0..<8])
+            let id = getCharacterId(uid: tag.uid, encrypted: encrypted)
+            return TagInfo(type: .character, id: id, signature: tag.signature)
+        case .unknown:
+            return TagInfo(type: .unknown, id: 0, signature: tag.signature)
+        }
+    }
+
+    /// Send a 0x55 command frame and await the 0x55 response payload (without checksum).
+    private func request55(kind: PendingKind, dev: IOHIDDevice, cmd: [UInt8], timeoutNs: UInt64 = 800_000_000) async throws -> [UInt8] {
+        // cmd must already include the leading 0x55, length, opcode, msg, ...
+        guard cmd.count >= 4, cmd[0] == 0x55 else { throw ToyPadReadError.malformedResponse }
+        let msg = cmd[3]
+
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[UInt8], Error>) in
+            pending55[msg] = Pending55(kind: kind, continuation: cont)
+            sendCommand(dev, cmd)
+
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: timeoutNs)
+                if let pending = self.pending55.removeValue(forKey: msg) {
+                    pending.continuation.resume(throwing: ToyPadReadError.timeout)
+                }
+            }
+        }
+    }
+
+    private func sendCommand(_ dev: IOHIDDevice, _ cmd: [UInt8]) {
+        var message = cmd
+        message.append(checksum(cmd))        // add checksum byte
+
+        // pad to 32 bytes
+        while message.count < 32 { message.append(0x00) }
+
+        message.withUnsafeBytes { raw in
+            let ptr = raw.bindMemory(to: UInt8.self).baseAddress!
+            let r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, 0, ptr, message.count)
+            if r == kIOReturnSuccess {
+                print("⬆️ OUT \(message.count) bytes cmd=\(cmd.map{String(format:"%02X",$0)}.joined(separator:" "))")
+            } else {
+                print("IOHIDDeviceSetReport failed: \(r)")
+            }
+        }
+    }
+
+    // MARK: Comm Utilities
+    
+    private func checksum(_ bytes: [UInt8]) -> UInt8 {
+        // modulo 256 sum
+        var s: UInt16 = 0
+        for b in bytes { s += UInt16(b) }
+        return UInt8(s & 0xFF)
+    }
+
+    private func createReadTagCommand(msg: UInt8, index: UInt8, page: UInt8) -> [UInt8] {
+        [0x55, 0x04, 0xD2, msg, index, page]
+    }
+    
     // MARK: Pad Utilities
     
     private func padName(_ pad: UInt8) -> String {
@@ -313,8 +427,93 @@ final class DimensionPad {
         bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
     }
     
-    private func uidHex(_ uid: [UInt8]) -> String {
-        uid.map { String(format: "%02X", $0) }.joined()
+    private func signatureString(_ uid: [UInt8]) -> String {
+        uid.map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+
+    // MARK: Tag decoding
+
+    private func detectTagType(_ block26: [UInt8]) -> TagType {
+        let vehicleMarker: [UInt8] = [0x00, 0x01, 0x00, 0x00]
+        guard block26.count >= vehicleMarker.count else { return .unknown }
+        for i in 0..<vehicleMarker.count where block26[i] != vehicleMarker[i] {
+            return .character
+        }
+        return .vehicle
+    }
+
+    private func getVehicleId(_ data: [UInt8]) -> Int {
+        guard data.count >= 2 else { return 0 }
+        return Int(UInt16(data[1]) << 8 | UInt16(data[0]))
+    }
+
+    private func getCharacterId(uid: [UInt8], encrypted: [UInt8]) -> Int {
+        guard uid.count == 7, encrypted.count >= 8 else { return 0 }
+        let key = generateKeys(uid)
+        let v0 = readUInt32LE(encrypted, offset: 0)
+        let v1 = readUInt32LE(encrypted, offset: 4)
+        let decrypted = teaDecrypt(values: (v0, v1), key: key)
+        guard decrypted.0 == decrypted.1 else { return 0 }
+        return Int(decrypted.0 & 0xFFFF)
+    }
+
+    private func readUInt32LE(_ buffer: [UInt8], offset: Int) -> UInt32 {
+        let b0 = UInt32(buffer[offset])
+        let b1 = UInt32(buffer[offset + 1]) << 8
+        let b2 = UInt32(buffer[offset + 2]) << 16
+        let b3 = UInt32(buffer[offset + 3]) << 24
+        return b0 | b1 | b2 | b3
+    }
+
+    private func rotateRight(_ value: UInt32, count: UInt32) -> UInt32 {
+        let normalized = count & 31
+        return (value >> normalized) | (value << (32 - normalized))
+    }
+
+    private func scramble(_ uid: [UInt8], count: Int) -> UInt32 {
+        var base: [UInt8] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xb7,
+            0xd5, 0xd7, 0xe6, 0xe7, 0xba, 0x3c, 0xa8, 0xd8,
+            0x75, 0x47, 0x68, 0xcf, 0x23, 0xe9, 0xfe, 0xaa
+        ]
+        for i in 0..<min(uid.count, 7) {
+            base[i] = uid[i]
+        }
+        base[count * 4 - 1] = 0xaa
+
+        var v2: UInt32 = 0
+        for i in 0..<count {
+            let b = readUInt32LE(base, offset: i * 4)
+            v2 = (b &+ rotateRight(v2, count: 25) &+ rotateRight(v2, count: 10) &- v2)
+        }
+        return v2
+    }
+
+    private func generateKeys(_ uid: [UInt8]) -> (UInt32, UInt32, UInt32, UInt32) {
+        return (
+            scramble(uid, count: 3),
+            scramble(uid, count: 4),
+            scramble(uid, count: 5),
+            scramble(uid, count: 6)
+        )
+    }
+
+    private func teaDecrypt(values: (UInt32, UInt32), key: (UInt32, UInt32, UInt32, UInt32)) -> (UInt32, UInt32) {
+        var v0 = values.0
+        var v1 = values.1
+        var sum: UInt32 = 0xc6ef3720
+        let delta: UInt32 = 0x9e3779b9
+        let k0 = key.0
+        let k1 = key.1
+        let k2 = key.2
+        let k3 = key.3
+
+        for _ in 0..<32 {
+            v1 = v1 &- (((v0 << 4) &+ k2) ^ (v0 &+ sum) ^ ((v0 >> 5) &+ k3))
+            v0 = v0 &- (((v1 << 4) &+ k0) ^ (v1 &+ sum) ^ ((v1 >> 5) &+ k1))
+            sum = sum &- delta
+        }
+        return (v0, v1)
     }
     
 }
