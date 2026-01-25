@@ -14,6 +14,18 @@ public struct TagInfo {
     public let signature: String
 }
 
+public struct PadState: Sendable {
+    public let present: Bool
+    public let uid: String?
+    public let name: String?
+
+    public init(present: Bool, uid: String?, name: String?) {
+        self.present = present
+        self.uid = uid
+        self.name = name
+    }
+}
+
 public struct TagEvent: Sendable {
     public enum Action: Sendable {
         case add
@@ -30,10 +42,10 @@ public struct TagEvent: Sendable {
 @MainActor
 public final class DimensionPad {
     @Published public private(set) var connected: Bool = false
-    @Published public private(set) var pads: [UInt8: (present: Bool, uid: String?)] = [
-        1: (false, nil),
-        2: (false, nil),
-        3: (false, nil)
+    @Published public private(set) var pads: [UInt8: PadState] = [
+        1: PadState(present: false, uid: nil, name: nil),
+        2: PadState(present: false, uid: nil, name: nil),
+        3: PadState(present: false, uid: nil, name: nil)
     ]
     public let events = PassthroughSubject<TagEvent, Never>()
 
@@ -142,14 +154,37 @@ public final class DimensionPad {
         }
     }
 
+    private func resolveNameForPad(pad: UInt8, signature: String) async {
+        do {
+            let info = try await readTagInfo(padByte: pad)
+            let name: String
+            switch info.type {
+            case .character:
+                let character = DimensionPadMetadata.getCharacterById(info.id)
+                let display = character?.name ?? String(info.id)
+                let world = character?.world ?? "Unknown"
+                name = "\(display) (\(world))"
+            case .vehicle:
+                let vehicle = DimensionPadMetadata.getVehicleById(info.id)
+                let display = vehicle?.name ?? String(info.id)
+                let world = vehicle?.world ?? "Unknown"
+                name = "\(display) (\(world))"
+            case .unknown:
+                return
+            }
 
-    public func color(pad: Pad, r: UInt8, g: UInt8, b: UInt8) {
-        guard let dev = self.device else { return }
-        switchPad(dev, pad: pad, r: r, g: g, b: b)
+            if pads[pad]?.uid == signature {
+                publishPad(pad, present: true, uid: signature, name: name)
+            }
+        } catch {
+            // ignore read failures
+        }
     }
 
-    private func publishPad(_ pad: UInt8, present: Bool, uid: String?) {
-        pads[pad] = (present, uid)
+
+
+    private func publishPad(_ pad: UInt8, present: Bool, uid: String?, name: String?) {
+        pads[pad] = PadState(present: present, uid: uid, name: name)
     }
 
     private func deviceMatched(_ dev: IOHIDDevice) async {
@@ -256,7 +291,10 @@ public final class DimensionPad {
             if presentTagByPad[ev.pad]?.signature != signature {
                 presentTagByPad[ev.pad] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
                 print("✅ \(padName(ev.pad)) inserted uid=\(signature)")
-                publishPad(ev.pad, present: true, uid: signature)
+                publishPad(ev.pad, present: true, uid: signature, name: nil)
+                Task { @MainActor in
+                    await resolveNameForPad(pad: ev.pad, signature: signature)
+                }
                 events.send(TagEvent(action: .add, pad: ev.pad, signature: signature, index: ev.index, uid: ev.uid))
             }
 
@@ -265,7 +303,7 @@ public final class DimensionPad {
             if let removed = presentTagByPad[ev.pad] {
                 presentTagByPad[ev.pad] = nil
                 print("❌ \(padName(ev.pad)) removed")
-                publishPad(ev.pad, present: false, uid: nil)
+                publishPad(ev.pad, present: false, uid: nil, name: nil)
                 events.send(TagEvent(action: .remove, pad: ev.pad, signature: removed.signature, index: removed.index, uid: removed.uid))
             }
 
@@ -389,6 +427,13 @@ public final class DimensionPad {
         return data16
     }
 
+    public func setColor(padByte: UInt8, r: UInt8, g: UInt8, b: UInt8) async throws {
+        guard let dev = self.device else { throw ToyPadReadError.notConnected }
+        let msg = nextMsg()
+        let cmd = createSetColorCommand(msg: msg, pad: padByte, r: r, g: g, b: b)
+        _ = try await request55(kind: .other, dev: dev, cmd: cmd)
+    }
+
     /// Send a 0x55 command frame and await the 0x55 response payload (without checksum).
     private func request55(kind: PendingKind, dev: IOHIDDevice, cmd: [UInt8], timeoutNs: UInt64 = 800_000_000) async throws -> [UInt8] {
         // cmd must already include the leading 0x55, length, opcode, msg, ...
@@ -443,6 +488,10 @@ public final class DimensionPad {
 
     private func createReadTagCommand(msg: UInt8, index: UInt8, page: UInt8) -> [UInt8] {
         [0x55, 0x04, 0xD2, msg, index, page]
+    }
+
+    private func createSetColorCommand(msg: UInt8, pad: UInt8, r: UInt8, g: UInt8, b: UInt8) -> [UInt8] {
+        [0x55, 0x06, 0xC0, msg, pad, r, g, b]
     }
     
     // MARK: Pad Utilities
