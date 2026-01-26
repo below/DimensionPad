@@ -94,4 +94,16 @@ try await pad.setColor(padByte: 1, r: 0, g: 255, b: 0)
 
 ## Demo
 
-There is a simple demo in `DimensinoPadDemo`. A more extensive demo SwiftUI demo app is `OutOfSpace`, which consumes this package.
+There is a simple demo in `DimensinoPadDemo`. A more extensive demo SwiftUI demo app is [`OutOfSpace`](https://github.com/below/OutOfSpace), which consumes this package.
+
+## Links
+
+http://wasabifan.github.io/ev3dev.github.io/docs/tutorials/using-lego-dimensions-toy-pad/
+https://github.com/AlinaNova21/node-ld
+https://github.com/dolmen-go/legodim/blob/f1c5b25864649ec34fb060457fa32d7832f01b1e/tag/uid.go#L43
+https://nfc.toys/workflow-inf.html
+https://retrodeck.readthedocs.io/en/latest/wiki_controllers/toystolife/lego-toypad/
+https://www.dajlab.org/jtoypad.html
+https://www.nxp.com/docs/en/data-sheet/NTAG213_215_216.pdf
+https://www.proxmark.io/www.proxmark.org/forum/viewtopic.php%3Fpid=20257.html
+https://www.wendelpunkt.de/toypad-challenge/
