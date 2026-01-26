@@ -2,23 +2,27 @@ import Foundation
 import Combine
 import IOKit.hid
 
+/// Type of LEGO Dimensions NFC tag payload.
 public enum TagType {
     case character
     case vehicle
     case unknown
 }
 
+/// Basic decoded tag information.
 public struct TagInfo {
     public let type: TagType
     public let id: Int
     public let signature: String
 }
 
+/// Published state for a single pad.
 public struct PadState: Sendable {
     public let present: Bool
     public let uid: String?
     public let name: String?
 
+    /// Creates a new pad state.
     public init(present: Bool, uid: String?, name: String?) {
         self.present = present
         self.uid = uid
@@ -26,6 +30,7 @@ public struct PadState: Sendable {
     }
 }
 
+/// Event emitted when a tag is added or removed.
 public struct TagEvent: Sendable {
     public enum Action: Sendable {
         case add
@@ -39,14 +44,18 @@ public struct TagEvent: Sendable {
     public let uid: [UInt8]
 }
 
+/// HID-backed interface to the LEGO Dimensions Toy Pad.
 @MainActor
 public final class DimensionPad {
+    /// Connection state for the HID device.
     @Published public private(set) var connected: Bool = false
+    /// Per-pad state (presence, UID, resolved name).
     @Published public private(set) var pads: [UInt8: PadState] = [
         1: PadState(present: false, uid: nil, name: nil),
         2: PadState(present: false, uid: nil, name: nil),
         3: PadState(present: false, uid: nil, name: nil)
     ]
+    /// Tag add/remove events emitted by the Toy Pad.
     public let events = PassthroughSubject<TagEvent, Never>()
 
     public enum Pad: UInt8 {
@@ -111,6 +120,7 @@ public final class DimensionPad {
         self.manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(0))
     }
     
+    /// Start  discovery and connect to the Toy Pad if present.
     public func connect() {
         let matching: [String: Any] = [
             kIOHIDVendorIDKey as String: vendorID,
@@ -134,6 +144,7 @@ public final class DimensionPad {
         print(r == kIOReturnSuccess ? "HID manager open ✅" : "HID manager open ❌ \(r)")
     }
  
+    /// Read and decode tag information for a given pad (1=center, 2=left, 3=right).
     public func readTagInfo(padByte: UInt8) async throws -> TagInfo {
         guard let tag = presentTagByPad[padByte] else { throw ToyPadReadError.tagNotPresent }
         let block = try await readPages(padByte: padByte, startPage: 0x24)
@@ -152,6 +163,14 @@ public final class DimensionPad {
         case .unknown:
             return TagInfo(type: .unknown, id: 0, signature: tag.signature)
         }
+    }
+
+    /// Set the RGB LED color for a pad (0=all, 1=center, 2=left, 3=right).
+    public func setColor(padByte: UInt8, r: UInt8, g: UInt8, b: UInt8) async throws {
+        guard let dev = self.device else { throw ToyPadReadError.notConnected }
+        let msg = nextMsg()
+        let cmd = createSetColorCommand(msg: msg, pad: padByte, r: r, g: g, b: b)
+        _ = try await request55(kind: .other, dev: dev, cmd: cmd)
     }
 
     private func resolveNameForPad(pad: UInt8, signature: String) async {
@@ -181,8 +200,6 @@ public final class DimensionPad {
         }
     }
 
-
-
     private func publishPad(_ pad: UInt8, present: Bool, uid: String?, name: String?) {
         pads[pad] = PadState(present: present, uid: uid, name: name)
     }
@@ -205,9 +222,6 @@ public final class DimensionPad {
 
         // INIT wakes it up
         sendOutputReport(dev, TOYPAD_INIT)
-
-        // Quick lightshow to indicate the device is active (await before registering input)
- //       await runLightshow(on: dev)
 
         // Register input callback
         inputReport = [UInt8](repeating: 0, count: 32)
@@ -427,13 +441,6 @@ public final class DimensionPad {
         return data16
     }
 
-    public func setColor(padByte: UInt8, r: UInt8, g: UInt8, b: UInt8) async throws {
-        guard let dev = self.device else { throw ToyPadReadError.notConnected }
-        let msg = nextMsg()
-        let cmd = createSetColorCommand(msg: msg, pad: padByte, r: r, g: g, b: b)
-        _ = try await request55(kind: .other, dev: dev, cmd: cmd)
-    }
-
     /// Send a 0x55 command frame and await the 0x55 response payload (without checksum).
     private func request55(kind: PendingKind, dev: IOHIDDevice, cmd: [UInt8], timeoutNs: UInt64 = 800_000_000) async throws -> [UInt8] {
         // cmd must already include the leading 0x55, length, opcode, msg, ...
@@ -599,5 +606,4 @@ public final class DimensionPad {
         }
         return (v0, v1)
     }
-    
 }

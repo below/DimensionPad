@@ -1,11 +1,13 @@
 import Foundation
 
+/// Character metadata decoded from the bundled dataset.
 public struct CharacterMetadata: Codable, Sendable {
     public let id: Int
     public let name: String
     public let world: String
 }
 
+/// Vehicle metadata decoded from the bundled dataset.
 public struct VehicleMetadata: Codable, Sendable {
     public let id: Int
     public let name: String
@@ -14,6 +16,7 @@ public struct VehicleMetadata: Codable, Sendable {
     public let step: Int?
 }
 
+/// Lookup helper for bundled character and vehicle metadata.
 public enum DimensionPadMetadata {
     private static let characterList: [CharacterMetadata] = {
         loadArray("minifigs", as: CharacterMetadata.self)
@@ -31,18 +34,22 @@ public enum DimensionPadMetadata {
         vehicleList.reduce(into: [:]) { $0[$1.id] = $1 }
     }()
 
+    /// Fetch a character by ID.
     public static func getCharacterById(_ id: Int) -> CharacterMetadata? {
         characters[id]
     }
 
+    /// Fetch a vehicle by ID.
     public static func getVehicleById(_ id: Int) -> VehicleMetadata? {
         vehicles[id]
     }
 
+    /// List all characters in the bundled dataset.
     public static func listCharacters() -> [CharacterMetadata] {
         characterList
     }
 
+    /// List all vehicles in the bundled dataset.
     public static func listVehicles() -> [VehicleMetadata] {
         vehicleList
     }
