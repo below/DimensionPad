@@ -36,7 +36,7 @@ pad.events
         switch event.action {
         case .add:
             Task {
-                let info = try await pad.readTagInfo(padByte: event.pad)
+                let info = try await pad.readTagInfo(pad: event.pad)
                 print("Added: \(info.signature) -> \(info.type)")
             }
         case .remove:
@@ -81,11 +81,8 @@ Access static metadata via `DimensionPadMetadata`:
 ## LED Control
 
 ```swift
-try await pad.setColor(padByte: 1, r: 0, g: 255, b: 0)
+try await pad.setColor(pad: .left, r: 0, g: 255, b: 0)
 ```
-
-`padByte` values:
-- 0 = all, 1 = center, 2 = left, 3 = right
 
 ## Notes
 

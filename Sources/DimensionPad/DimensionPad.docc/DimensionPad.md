@@ -10,8 +10,8 @@ The most common flow is:
 1. Create a `DimensionPad` instance.
 2. Call `connect()`.
 3. Listen to `events` for tag add/remove.
-4. Call `readTagInfo(padByte:)` to decode a tag.
-5. Maybe call setColor(padByte:r:g:b:) to set a color in response
+4. Call `readTagInfo(pad:)` to decode a tag.
+5. Maybe call setColor(pad:r:g:b:) to set a color in response
 
 ## Quick Start
 
@@ -30,7 +30,7 @@ pad.events
     .sink { event in
         if event.action == .add {
             Task {
-                let info = try await pad.readTagInfo(padByte: event.pad)
+                let info = try await pad.readTagInfo(pad: event.pad)
                 print("Tag: \(info.signature) type=\(info.type) id=\(info.id)")
             }
         }
