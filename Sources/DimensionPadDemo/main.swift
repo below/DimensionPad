@@ -20,7 +20,7 @@ pad.events
         case .add:
             Task {
                 do {
-                    let info = try await pad.readTagInfo(padByte: event.pad)
+                    let info = try await pad.readTagInfo(pad: event.pad)
                     switch info.type {
                     case .character:
                         let character = DimensionPadMetadata.getCharacterById(info.id)

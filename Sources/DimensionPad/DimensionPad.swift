@@ -30,6 +30,14 @@ public struct PadState: Sendable {
     }
 }
 
+public enum Pad: UInt8, Sendable {
+    case all = 0
+    case center = 1
+    case left = 2
+    case right = 3
+    
+}
+
 /// Event emitted when a tag is added or removed.
 public struct TagEvent: Sendable {
     public enum Action: Sendable {
@@ -38,7 +46,7 @@ public struct TagEvent: Sendable {
     }
 
     public let action: Action
-    public let pad: UInt8
+    public let pad: Pad
     public let signature: String
     public let index: UInt8
     public let uid: [UInt8]
@@ -57,13 +65,6 @@ public final class DimensionPad {
     ]
     /// Tag add/remove events emitted by the Toy Pad.
     public let events = PassthroughSubject<TagEvent, Never>()
-
-    public enum Pad: UInt8 {
-        case all = 0
-        case center = 1
-        case left = 2
-        case right = 3
-    }
 
     enum ToyPadReadError: Error {
         case notConnected
@@ -144,10 +145,11 @@ public final class DimensionPad {
         print(r == kIOReturnSuccess ? "HID manager open ✅" : "HID manager open ❌ \(r)")
     }
  
-    /// Read and decode tag information for a given pad (1=center, 2=left, 3=right).
-    public func readTagInfo(padByte: UInt8) async throws -> TagInfo {
-        guard let tag = presentTagByPad[padByte] else { throw ToyPadReadError.tagNotPresent }
-        let block = try await readPages(padByte: padByte, startPage: 0x24)
+    /// Read and decode tag information for a given pad
+    public func readTagInfo(pad: Pad) async throws -> TagInfo {
+        guard pad != .all else { throw ToyPadReadError.tagNotPresent }
+        guard let tag = presentTagByPad[pad.rawValue] else { throw ToyPadReadError.tagNotPresent }
+        let block = try await readPages(padByte: pad.rawValue, startPage: 0x24)
         guard block.count >= 16 else { throw ToyPadReadError.malformedResponse }
 
         let payloadView = Array(block[8..<12])
@@ -165,17 +167,18 @@ public final class DimensionPad {
         }
     }
 
-    /// Set the RGB LED color for a pad (0=all, 1=center, 2=left, 3=right).
-    public func setColor(padByte: UInt8, r: UInt8, g: UInt8, b: UInt8) async throws {
+    /// Set the RGB LED color for a pad, or all pads
+    public func setColor(pad: Pad, r: UInt8, g: UInt8, b: UInt8) async throws {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
         let msg = nextMsg()
-        let cmd = createSetColorCommand(msg: msg, pad: padByte, r: r, g: g, b: b)
+        let cmd = createSetColorCommand(msg: msg, pad: pad.rawValue, r: r, g: g, b: b)
         _ = try await request55(kind: .other, dev: dev, cmd: cmd)
     }
 
-    private func resolveNameForPad(pad: UInt8, signature: String) async {
+    private func resolveNameForPad(pad: Pad, signature: String) async {
+        guard pad != .all else { return }
         do {
-            let info = try await readTagInfo(padByte: pad)
+            let info = try await readTagInfo(pad: pad)
             let name: String
             switch info.type {
             case .character:
@@ -192,7 +195,7 @@ public final class DimensionPad {
                 return
             }
 
-            if pads[pad]?.uid == signature {
+            if pads[pad.rawValue]?.uid == signature {
                 publishPad(pad, present: true, uid: signature, name: name)
             }
         } catch {
@@ -200,8 +203,8 @@ public final class DimensionPad {
         }
     }
 
-    private func publishPad(_ pad: UInt8, present: Bool, uid: String?, name: String?) {
-        pads[pad] = PadState(present: present, uid: uid, name: name)
+    private func publishPad(_ pad: Pad, present: Bool, uid: String?, name: String?) {
+        pads[pad.rawValue] = PadState(present: present, uid: uid, name: name)
     }
 
     private func deviceMatched(_ dev: IOHIDDevice) async {
@@ -276,7 +279,7 @@ public final class DimensionPad {
     }
 
     private struct TagEv {
-        let pad: UInt8        // 1=center, 2=left, 3=right
+        let pad: Pad
         let index: UInt8      // index
         let action: UInt8     // 0=inserted, 1=removed
         let uid: [UInt8]      // 7 bytes
@@ -286,7 +289,7 @@ public final class DimensionPad {
         guard b.count == 32 else { return nil }
         guard b[0] == 0x56, b[1] == 0x0B else { return nil }
 
-        let pad = b[2]
+        guard let pad = Pad(rawValue: b[2]) else { return nil }
         let index = b[4]          // 0,1,2  (slot)
         let action = b[5]
         let uid = Array(b[6...12]) // 7 bytes
@@ -302,9 +305,9 @@ public final class DimensionPad {
         switch ev.action {
         case 0: // inserted
             // Only log/publish if this is a new UID for that pad
-            if presentTagByPad[ev.pad]?.signature != signature {
-                presentTagByPad[ev.pad] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
-                print("✅ \(padName(ev.pad)) inserted uid=\(signature)")
+            if presentTagByPad[ev.pad.rawValue]?.signature != signature {
+                presentTagByPad[ev.pad.rawValue] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
+                print("✅ \(ev.pad.rawValue) inserted uid=\(signature)")
                 publishPad(ev.pad, present: true, uid: signature, name: nil)
                 Task { @MainActor in
                     await resolveNameForPad(pad: ev.pad, signature: signature)
@@ -314,9 +317,9 @@ public final class DimensionPad {
 
         case 1: // removed
             // Only log/publish if something was present
-            if let removed = presentTagByPad[ev.pad] {
-                presentTagByPad[ev.pad] = nil
-                print("❌ \(padName(ev.pad)) removed")
+            if let removed = presentTagByPad[ev.pad.rawValue] {
+                presentTagByPad[ev.pad.rawValue] = nil
+                print("❌ \(ev.pad.rawValue) removed")
                 publishPad(ev.pad, present: false, uid: nil, name: nil)
                 events.send(TagEvent(action: .remove, pad: ev.pad, signature: removed.signature, index: removed.index, uid: removed.uid))
             }
@@ -501,17 +504,6 @@ public final class DimensionPad {
         [0x55, 0x06, 0xC0, msg, pad, r, g, b]
     }
     
-    // MARK: Pad Utilities
-    
-    private func padName(_ pad: UInt8) -> String {
-        switch pad {
-        case 1: return "Center"
-        case 2: return "Left"
-        case 3: return "Right"
-        default: return "Pad \(pad)"
-        }
-    }
-    
     // MARK: General Utilities
     
     private func hex(_ bytes: [UInt8]) -> String {
@@ -607,3 +599,4 @@ public final class DimensionPad {
         return (v0, v1)
     }
 }
+
