@@ -84,6 +84,39 @@ Access static metadata via `DimensionPadMetadata`:
 try await pad.setColor(pad: .left, r: 0, g: 255, b: 0)
 ```
 
+### Flash
+
+```swift
+// Flash a single pad
+try await pad.flash(pad: .center, tickOn: 10, tickOff: 10, tickCount: 8, r: 255, g: 0, b: 0)
+
+// Flash forever using the helper
+let forever = FlashPad.forever(tickOn: 6, tickOff: 6, r: 0, g: 0, b: 255)
+try await pad.flash(pad: .left, flashPad: forever)
+
+// Flash all pads with independent patterns
+let center = FlashPad(tickOn: 8, tickOff: 8, tickCount: 12, r: 255, g: 255, b: 0)
+let left = FlashPad(tickOn: 4, tickOff: 4, tickCount: 0xFF, r: 0, g: 255, b: 255)
+let right = FlashPad(tickOn: 12, tickOff: 12, tickCount: 6, r: 255, g: 0, b: 255)
+try await pad.flashAll(center: center, left: left, right: right)
+```
+
+### Fade
+
+```swift
+// Fade a single pad
+try await pad.fade(pad: .center, tickTime: 20, tickCount: 5, r: 0, g: 0, b: 255)
+
+// Fade all pads with independent patterns
+let fadeCenter = FadePad(tickTime: 24, tickCount: 3, r: 255, g: 0, b: 0)
+let fadeLeft = FadePad(tickTime: 12, tickCount: 0xFF, r: 0, g: 255, b: 0)
+let fadeRight = FadePad(tickTime: 18, tickCount: 7, r: 255, g: 255, b: 255)
+try await pad.fadeAll(center: fadeCenter, left: fadeLeft, right: fadeRight)
+
+// Fade to random colors
+try await pad.fadeRandom(pad: .right, tickTime: 16, tickCount: 10)
+```
+
 ## Notes
 
 - HID access may require the app to be run with appropriate USB permissions (Sandbox entitlement: USB device access).
