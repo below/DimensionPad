@@ -1,4 +1,4 @@
-# DimensionPad
+# ``DimensionPad``
 
 A Swift interface for the LEGO Dimensions Toy Pad over USB on macOS.
 
