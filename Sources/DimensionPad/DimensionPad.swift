@@ -20,12 +20,14 @@ public struct TagInfo {
 public struct PadState: Sendable {
     public let present: Bool
     public let uid: String?
+    public let characterID: Int?
     public let name: String?
 
     /// Creates a new pad state.
-    public init(present: Bool, uid: String?, name: String?) {
+    public init(present: Bool, uid: String?, characterID: Int?, name: String?) {
         self.present = present
         self.uid = uid
+        self.characterID = characterID
         self.name = name
     }
 }
@@ -59,9 +61,9 @@ public final class DimensionPad {
     @Published public private(set) var connected: Bool = false
     /// Per-pad state (presence, UID, resolved name).
     @Published public private(set) var pads: [UInt8: PadState] = [
-        1: PadState(present: false, uid: nil, name: nil),
-        2: PadState(present: false, uid: nil, name: nil),
-        3: PadState(present: false, uid: nil, name: nil)
+        1: PadState(present: false, uid: nil, characterID: nil, name: nil),
+        2: PadState(present: false, uid: nil, characterID: nil, name: nil),
+        3: PadState(present: false, uid: nil, characterID: nil, name: nil)
     ]
     /// Tag add/remove events emitted by the Toy Pad.
     public let events = PassthroughSubject<TagEvent, Never>()
@@ -91,10 +93,15 @@ public final class DimensionPad {
     private var inputReport = [UInt8](repeating: 0, count: 32)
 
     internal var msgCounter: UInt8 = 0x01
-    private func nextMsg() -> UInt8 {
-        let m = msgCounter
-        msgCounter &+= 1
-        return m
+    private func nextMsgAvailable() throws -> UInt8 {
+        for _ in 0..<256 {
+            let m = msgCounter
+            msgCounter &+= 1
+            if pending55[m] == nil {
+                return m
+            }
+        }
+        throw ToyPadReadError.malformedResponse
     }
 
     internal enum PendingKind {
@@ -116,6 +123,7 @@ public final class DimensionPad {
     }
 
     private var presentTagByPad: [UInt8: PresentTag] = [:]
+    private var isManagerConfigured = false
 
     public init() {
         self.manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(0))
@@ -123,6 +131,8 @@ public final class DimensionPad {
     
     /// Start  discovery and connect to the Toy Pad if present.
     public func connect() {
+        guard !isManagerConfigured else { return }
+        isManagerConfigured = true
         let matching: [String: Any] = [
             kIOHIDVendorIDKey as String: vendorID,
             kIOHIDProductIDKey as String: productID
@@ -170,9 +180,9 @@ public final class DimensionPad {
     /// Set the RGB LED color for a pad, or all pads
     public func setColor(pad: Pad, r: UInt8, g: UInt8, b: UInt8) async throws {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
-        let msg = nextMsg()
+        let msg = try nextMsgAvailable()
         let cmd = createSetColorCommand(msg: msg, pad: pad.rawValue, r: r, g: g, b: b)
-        _ = try await request55(kind: .other, dev: dev, cmd: cmd)
+        sendCommand(dev, cmd)
     }
 
     private func resolveNameForPad(pad: Pad, signature: String) async {
@@ -196,15 +206,15 @@ public final class DimensionPad {
             }
 
             if pads[pad.rawValue]?.uid == signature {
-                publishPad(pad, present: true, uid: signature, name: name)
+                publishPad(pad, present: true, uid: signature, characterID: info.id, name: name)
             }
         } catch {
             // ignore read failures
         }
     }
 
-    private func publishPad(_ pad: Pad, present: Bool, uid: String?, name: String?) {
-        pads[pad.rawValue] = PadState(present: present, uid: uid, name: name)
+    private func publishPad(_ pad: Pad, present: Bool, uid: String?, characterID: Int?, name: String?) {
+        pads[pad.rawValue] = PadState(present: present, uid: uid, characterID: characterID, name: name)
     }
 
     private func deviceMatched(_ dev: IOHIDDevice) async {
@@ -251,9 +261,10 @@ public final class DimensionPad {
 
     private func deviceRemoved(_ dev: IOHIDDevice) {
         if let current = device, CFEqual(current, dev) {
-            pending55.removeAll()
+            cancelPendingRequests()
             device = nil
             connected = false
+            resetPads()
             print("Device removed.")
         }
     }
@@ -308,7 +319,7 @@ public final class DimensionPad {
             if presentTagByPad[ev.pad.rawValue]?.signature != signature {
                 presentTagByPad[ev.pad.rawValue] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
                 print("✅ \(ev.pad.rawValue) inserted uid=\(signature)")
-                publishPad(ev.pad, present: true, uid: signature, name: nil)
+                publishPad(ev.pad, present: true, uid: signature, characterID: nil, name: nil)
                 Task { @MainActor in
                     await resolveNameForPad(pad: ev.pad, signature: signature)
                 }
@@ -320,7 +331,7 @@ public final class DimensionPad {
             if let removed = presentTagByPad[ev.pad.rawValue] {
                 presentTagByPad[ev.pad.rawValue] = nil
                 print("❌ \(ev.pad.rawValue) removed")
-                publishPad(ev.pad, present: false, uid: nil, name: nil)
+                publishPad(ev.pad, present: false, uid: nil, characterID: nil, name: nil)
                 events.send(TagEvent(action: .remove, pad: ev.pad, signature: removed.signature, index: removed.index, uid: removed.uid))
             }
 
@@ -429,7 +440,7 @@ public final class DimensionPad {
 
         guard let tag = presentTagByPad[padByte] else { throw ToyPadReadError.tagNotPresent }
         let index = tag.index
-        let msg = nextMsg()
+        let msg = try nextMsgAvailable()
         print("D2 READ msg=\(msg) pad=\(padByte) index=\(index) page=\(String(format:"%02X", startPage))")
 
         // cmd: 55 04 D2 <msg> <index> <page>
@@ -451,6 +462,10 @@ public final class DimensionPad {
         let msg = cmd[3]
 
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[UInt8], Error>) in
+            if pending55[msg] != nil {
+                cont.resume(throwing: ToyPadReadError.malformedResponse)
+                return
+            }
             pending55[msg] = Pending55(kind: kind, continuation: cont)
             sendCommand(dev, cmd)
 
@@ -461,6 +476,21 @@ public final class DimensionPad {
                 }
             }
         }
+    }
+
+    private func cancelPendingRequests() {
+        let pending = pending55
+        pending55.removeAll()
+        for (_, item) in pending {
+            item.continuation.resume(throwing: ToyPadReadError.notConnected)
+        }
+    }
+
+    private func resetPads() {
+        presentTagByPad.removeAll()
+        pads[Pad.center.rawValue] = PadState(present: false, uid: nil, characterID: nil, name: nil)
+        pads[Pad.left.rawValue] = PadState(present: false, uid: nil, characterID: nil, name: nil)
+        pads[Pad.right.rawValue] = PadState(present: false, uid: nil, characterID: nil, name: nil)
     }
 
     private func switchPad(_ dev: IOHIDDevice, pad: Pad, r: UInt8, g: UInt8, b: UInt8) {
@@ -599,4 +629,3 @@ public final class DimensionPad {
         return (v0, v1)
     }
 }
-
