@@ -1,18 +1,34 @@
 # DimensionPad
 
-A Swift package for talking to the LEGO Dimensions Toy Pad over USB HID on macOS.
+A Swift package for communicating with the LEGO Dimensions Toy Pad over USB HID on macOS.
 
 It provides:
 - Device discovery and connection management.
 - Tag add/remove events with UID and panel.
 - Tag reads (including character/vehicle ID decoding).
-- Metadata lookup (character/vehicle names/worlds).
+- Metadata lookup (character/vehicle names/vehicles/worlds).
 - Basic LED control.
+
+## Motivation
+
+After discovering that LEGO Dimensions tags are essentially NFC tags — which can be used to trigger iOS Shortcuts and other fun experiments — I finally got my hands on a used Toy Pad. These come relatively cheap now, as the backend infrastructure for LEGO Dimensions appears to be slowly falling apart.
+
+And since there is no such thing as “too many side projects,” I returned to an old favorite of mine: talking to USB devices. Let's see if there will ever be a *real usecase* for it. :p
 
 ## Requirements
 
 - macOS 13+ (IOKit HID)
-- LEGO Dimensions Toy Pad (Wii, Playstation variant)
+- LEGO Dimensions Toy Pad (Wii, PlayStation variant)
+
+## Demo
+
+There is a simple demo which can be started just by calling
+
+```sh
+swift run DimensionPadDemo
+```
+
+A more extensive SwiftUI demo app is [`OutOfSpace`](https://github.com/below/OutOfSpace), which consumes this package.
 
 ## Install
 
@@ -58,13 +74,20 @@ RunLoop.main.run()
 
 ### Tag Events
 
-- `events: PassthroughSubject<TagEvent, Never>`
+- `events` is a publisher that emits `TagEvent` values.
 - `TagEvent` includes `action`, `pad`, `index`, `signature`, and `uid` bytes.
 
 ### Pad State
 
-`pads` is a published dictionary of pad number to `PadState`:
+`pads` is a published `PadSlots` value representing the current state of the Toy Pad:
 
+- `center: PadState`
+- `left: Set<PadState>`
+- `right: Set<PadState>`
+
+The center pad can hold only a single tag at a time, whereas the left and right pads can each hold multiple tags (up to three each). The left and right pads are represented as unordered sets because the individual slots have no defined or stable ordering — only presence and identity matter. The number of tags on left and right pads is simply limited by hardware constraints.
+
+Each `PadState` contains:
 - `present`: Bool
 - `uid`: String?
 - `name`: String? (resolved from metadata)
@@ -121,10 +144,6 @@ try await pad.fadeRandom(pad: .right, tickTime: 16, tickCount: 10)
 
 - HID access may require the app to be run with appropriate USB permissions (Sandbox entitlement: USB device access).
 - Metadata is bundled from the `node-toypad` datasets (minifigs/vehicles).
-
-## Demo
-
-There is a simple demo in `DimensinoPadDemo`. A more extensive demo SwiftUI demo app is [`OutOfSpace`](https://github.com/below/OutOfSpace), which consumes this package.
 
 ## Links
 

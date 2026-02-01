@@ -15,7 +15,7 @@ public struct TagInfo {
 }
 
 /// Published state for a single pad.
-public struct PadState: Sendable {
+public struct PadState: Sendable, Hashable {
     public let present: Bool
     public let uid: String?
     public let characterID: Int?
@@ -28,6 +28,14 @@ public struct PadState: Sendable {
         self.characterID = characterID
         self.name = name
     }
+
+    public static func == (lhs: PadState, rhs: PadState) -> Bool {
+        lhs.uid == rhs.uid
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(uid)
+    }
 }
 
 public enum Pad: UInt8, Sendable {
@@ -35,6 +43,18 @@ public enum Pad: UInt8, Sendable {
     case center = 1
     case left = 2
     case right = 3
+}
+
+public struct PadSlots: Sendable {
+    public var center: PadState
+    public var left: Set<PadState>
+    public var right: Set<PadState>
+
+    public init(center: PadState, left: Set<PadState> = [], right: Set<PadState> = []) {
+        self.center = center
+        self.left = left
+        self.right = right
+    }
 }
 
 /// Flash configuration for a pad.

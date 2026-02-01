@@ -8,11 +8,11 @@ public final class DimensionPad {
     /// Connection state for the HID device.
     @Published public private(set) var connected: Bool = false
     /// Per-pad state (presence, UID, resolved name).
-    @Published public private(set) var pads: [UInt8: PadState] = [
-        1: PadState(present: false, uid: nil, characterID: nil, name: nil),
-        2: PadState(present: false, uid: nil, characterID: nil, name: nil),
-        3: PadState(present: false, uid: nil, characterID: nil, name: nil)
-    ]
+    @Published public private(set) var pads = PadSlots(
+        center: PadState(present: false, uid: nil, characterID: nil, name: nil),
+        left: [],
+        right: []
+    )
     /// Tag add/remove events emitted by the Toy Pad.
     public let events = PassthroughSubject<TagEvent, Never>()
 
@@ -146,7 +146,11 @@ public final class DimensionPad {
                 return
             }
 
-            if pads[pad.rawValue]?.uid == signature {
+            if pad == .center {
+                if pads.center.uid == signature {
+                    publishPad(pad, present: true, uid: signature, characterID: info.id, name: name)
+                }
+            } else if containsUid(signature, in: pad) {
                 publishPad(pad, present: true, uid: signature, characterID: info.id, name: name)
             }
         } catch {
@@ -155,7 +159,45 @@ public final class DimensionPad {
     }
 
     private func publishPad(_ pad: Pad, present: Bool, uid: String?, characterID: Int?, name: String?) {
-        pads[pad.rawValue] = PadState(present: present, uid: uid, characterID: characterID, name: name)
+        var next = pads
+        switch pad {
+        case .center:
+            next.center = PadState(present: present, uid: uid, characterID: characterID, name: name)
+        case .left:
+            updateSet(&next.left, present: present, uid: uid, characterID: characterID, name: name)
+        case .right:
+            updateSet(&next.right, present: present, uid: uid, characterID: characterID, name: name)
+        case .all:
+            break
+        }
+        pads = next
+    }
+
+    private func updateSet(_ set: inout Set<PadState>, present: Bool, uid: String?, characterID: Int?, name: String?) {
+        guard let uid else {
+            if !present {
+                set.removeAll()
+            }
+            return
+        }
+
+        set = set.filter { $0.uid != uid }
+        if present {
+            set.insert(PadState(present: true, uid: uid, characterID: characterID, name: name))
+        }
+    }
+
+    private func containsUid(_ uid: String, in pad: Pad) -> Bool {
+        switch pad {
+        case .left:
+            return pads.left.contains { $0.uid == uid }
+        case .right:
+            return pads.right.contains { $0.uid == uid }
+        case .center:
+            return pads.center.uid == uid
+        case .all:
+            return false
+        }
     }
 
     private func deviceMatched(_ dev: IOHIDDevice) async {
@@ -272,7 +314,7 @@ public final class DimensionPad {
             if let removed = presentTagByPad[ev.pad.rawValue] {
                 presentTagByPad[ev.pad.rawValue] = nil
                 print("❌ \(ev.pad.rawValue) removed")
-                publishPad(ev.pad, present: false, uid: nil, characterID: nil, name: nil)
+                publishPad(ev.pad, present: false, uid: removed.signature, characterID: nil, name: nil)
                 events.send(TagEvent(action: .remove, pad: ev.pad, signature: removed.signature, index: removed.index, uid: removed.uid))
             }
 
@@ -430,9 +472,7 @@ public final class DimensionPad {
 
     private func resetPads() {
         presentTagByPad.removeAll()
-        pads[Pad.center.rawValue] = PadState(present: false, uid: nil, characterID: nil, name: nil)
-        pads[Pad.left.rawValue] = PadState(present: false, uid: nil, characterID: nil, name: nil)
-        pads[Pad.right.rawValue] = PadState(present: false, uid: nil, characterID: nil, name: nil)
+        pads = PadSlots(center: PadState(present: false, uid: nil, characterID: nil, name: nil))
     }
 
     private func switchPad(_ dev: IOHIDDevice, pad: Pad, r: UInt8, g: UInt8, b: UInt8) {
