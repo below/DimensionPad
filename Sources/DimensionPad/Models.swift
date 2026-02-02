@@ -20,13 +20,15 @@ public struct PadState: Sendable, Hashable {
     public let uid: String?
     public let characterID: Int?
     public let name: String?
+    public let world: String?
 
     /// Creates a new pad state.
-    public init(present: Bool, uid: String?, characterID: Int?, name: String?) {
+    public init(present: Bool, uid: String?, characterID: Int?, name: String?, world: String?) {
         self.present = present
         self.uid = uid
         self.characterID = characterID
         self.name = name
+        self.world = world
     }
 
     public static func == (lhs: PadState, rhs: PadState) -> Bool {

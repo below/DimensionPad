@@ -91,6 +91,7 @@ Each `PadState` contains:
 - `present`: Bool
 - `uid`: String?
 - `name`: String? (resolved from metadata)
+- `world`: String? (resolved from metadata)
 
 ### Metadata
 
