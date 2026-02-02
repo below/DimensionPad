@@ -161,4 +161,9 @@ extension DimensionPad {
         // 0x55 0x05 0xC4 <msg> <pad> <tickTime> <tickCount>
         [0x55, 0x05, 0xC4, msg, pad, tickTime, tickCount]
     }
+
+    func createTagListCommand(msg: UInt8) -> [UInt8] {
+        // 0x55 0x02 0xD0 <msg>
+        [0x55, 0x02, 0xD0, msg]
+    }
 }

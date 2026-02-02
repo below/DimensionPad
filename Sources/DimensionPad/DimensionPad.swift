@@ -9,7 +9,7 @@ public final class DimensionPad {
     @Published public private(set) var connected: Bool = false
     /// Per-pad state (presence, UID, resolved name).
     @Published public private(set) var pads = PadSlots(
-        center: PadState(present: false, uid: nil, characterID: nil, name: nil),
+        center: PadState(present: false, uid: nil, characterID: nil, name: nil, world: nil),
         left: [],
         right: []
     )
@@ -40,6 +40,7 @@ public final class DimensionPad {
     ]
 
     private var inputReport = [UInt8](repeating: 0, count: 32)
+    private let debugLoggingEnabled = ProcessInfo.processInfo.environment["DIMENSIONPAD_DEBUG_LOGS"] == "1"
 
     internal var msgCounter: UInt8 = 0x01
     func nextMsgAvailable() throws -> UInt8 {
@@ -55,6 +56,7 @@ public final class DimensionPad {
 
     internal enum PendingKind {
         case readPages
+        case tagList
         case other
     }
 
@@ -71,7 +73,12 @@ public final class DimensionPad {
         let index: UInt8
     }
 
-    private var presentTagByPad: [UInt8: PresentTag] = [:]
+    private struct TagSlotKey: Hashable {
+        let pad: Pad
+        let index: UInt8
+    }
+
+    private var presentTagBySlot: [TagSlotKey: PresentTag] = [:]
     private var isManagerConfigured = false
 
     public init() {
@@ -101,14 +108,37 @@ public final class DimensionPad {
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
         let r = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        print(r == kIOReturnSuccess ? "HID manager open ✅" : "HID manager open ❌ \(r)")
+        if debugLoggingEnabled {
+            print(r == kIOReturnSuccess ? "HID manager open ✅" : "HID manager open ❌ \(r)")
+        }
     }
  
     /// Read and decode tag information for a given pad
     public func readTagInfo(pad: Pad) async throws -> TagInfo {
         guard pad != .all else { throw ToyPadReadError.tagNotPresent }
-        guard let tag = presentTagByPad[pad.rawValue] else { throw ToyPadReadError.tagNotPresent }
-        let block = try await readPages(padByte: pad.rawValue, startPage: 0x24)
+        guard let tag = firstTag(for: pad) else { throw ToyPadReadError.tagNotPresent }
+        let block = try await readPages(tagIndex: tag.index, startPage: 0x24)
+        guard block.count >= 16 else { throw ToyPadReadError.malformedResponse }
+
+        let payloadView = Array(block[8..<12])
+        let type = detectTagType(payloadView)
+        switch type {
+        case .vehicle:
+            let id = getVehicleId(block)
+            return TagInfo(type: .vehicle, id: id, signature: tag.signature)
+        case .character:
+            let encrypted = Array(block[0..<8])
+            let id = getCharacterId(uid: tag.uid, encrypted: encrypted)
+            return TagInfo(type: .character, id: id, signature: tag.signature)
+        case .unknown:
+            return TagInfo(type: .unknown, id: 0, signature: tag.signature)
+        }
+    }
+
+    private func readTagInfo(pad: Pad, signature: String) async throws -> TagInfo {
+        guard pad != .all else { throw ToyPadReadError.tagNotPresent }
+        guard let tag = tagFor(pad: pad, signature: signature) else { throw ToyPadReadError.tagNotPresent }
+        let block = try await readPages(tagIndex: tag.index, startPage: 0x24)
         guard block.count >= 16 else { throw ToyPadReadError.malformedResponse }
 
         let payloadView = Array(block[8..<12])
@@ -129,51 +159,52 @@ public final class DimensionPad {
     private func resolveNameForPad(pad: Pad, signature: String) async {
         guard pad != .all else { return }
         do {
-            let info = try await readTagInfo(pad: pad)
+            let info = try await readTagInfo(pad: pad, signature: signature)
             let name: String
+            let world: String
             switch info.type {
             case .character:
                 let character = DimensionPadMetadata.getCharacterById(info.id)
                 let display = character?.name ?? String(info.id)
-                let world = character?.world ?? "Unknown"
-                name = "\(display) (\(world))"
+                world = character?.world ?? "Unknown"
+                name = display
             case .vehicle:
                 let vehicle = DimensionPadMetadata.getVehicleById(info.id)
                 let display = vehicle?.name ?? String(info.id)
-                let world = vehicle?.world ?? "Unknown"
-                name = "\(display) (\(world))"
+                world = vehicle?.world ?? "Unknown"
+                name = display
             case .unknown:
                 return
             }
 
             if pad == .center {
                 if pads.center.uid == signature {
-                    publishPad(pad, present: true, uid: signature, characterID: info.id, name: name)
+                    publishPad(pad, present: true, uid: signature, characterID: info.id, name: name, world: world)
                 }
             } else if containsUid(signature, in: pad) {
-                publishPad(pad, present: true, uid: signature, characterID: info.id, name: name)
+                publishPad(pad, present: true, uid: signature, characterID: info.id, name: name, world: world)
             }
         } catch {
             // ignore read failures
         }
     }
 
-    private func publishPad(_ pad: Pad, present: Bool, uid: String?, characterID: Int?, name: String?) {
+    private func publishPad(_ pad: Pad, present: Bool, uid: String?, characterID: Int?, name: String?, world: String?) {
         var next = pads
         switch pad {
         case .center:
-            next.center = PadState(present: present, uid: uid, characterID: characterID, name: name)
+            next.center = PadState(present: present, uid: uid, characterID: characterID, name: name, world: world)
         case .left:
-            updateSet(&next.left, present: present, uid: uid, characterID: characterID, name: name)
+            updateSet(&next.left, present: present, uid: uid, characterID: characterID, name: name, world: world)
         case .right:
-            updateSet(&next.right, present: present, uid: uid, characterID: characterID, name: name)
+            updateSet(&next.right, present: present, uid: uid, characterID: characterID, name: name, world: world)
         case .all:
             break
         }
         pads = next
     }
 
-    private func updateSet(_ set: inout Set<PadState>, present: Bool, uid: String?, characterID: Int?, name: String?) {
+    private func updateSet(_ set: inout Set<PadState>, present: Bool, uid: String?, characterID: Int?, name: String?, world: String?) {
         guard let uid else {
             if !present {
                 set.removeAll()
@@ -183,7 +214,7 @@ public final class DimensionPad {
 
         set = set.filter { $0.uid != uid }
         if present {
-            set.insert(PadState(present: true, uid: uid, characterID: characterID, name: name))
+            set.insert(PadState(present: true, uid: uid, characterID: characterID, name: name, world: world))
         }
     }
 
@@ -200,15 +231,43 @@ public final class DimensionPad {
         }
     }
 
+    private func firstTag(for pad: Pad) -> PresentTag? {
+        return presentTagBySlot.first { $0.key.pad == pad }?.value
+    }
+
+    private func tagFor(pad: Pad, signature: String) -> PresentTag? {
+        return presentTagBySlot.first { $0.key.pad == pad && $0.value.signature == signature }?.value
+    }
+
+    private func parseTagList(_ payload: [UInt8]) -> [(Pad, UInt8)] {
+        var results: [(Pad, UInt8)] = []
+        var i = 0
+        while i + 1 < payload.count {
+            let padIndex = payload[i]
+            let tagType = payload[i + 1]
+            i += 2
+
+            if padIndex == 0 { continue }
+            let padNum = padIndex >> 4
+            let index = padIndex & 0x0F
+            guard let pad = Pad(rawValue: padNum) else { continue }
+            if tagType != 0x00 { continue }
+            results.append((pad, index))
+        }
+        return results
+    }
+
     private func deviceMatched(_ dev: IOHIDDevice) async {
         device = dev
         connected = true
         // New USB session → reset protocol state
         msgCounter = 0x00
         pending55.removeAll()
-        presentTagByPad.removeAll()
+        presentTagBySlot.removeAll()
         
-        print("Device matched: \((IOHIDDeviceGetProperty(dev,  kIOHIDProductKey as CFString) as? String) ?? "-")")
+        if debugLoggingEnabled {
+            print("Device matched: \((IOHIDDeviceGetProperty(dev,  kIOHIDProductKey as CFString) as? String) ?? "-")")
+        }
 
         let r = IOHIDDeviceOpen(dev, IOOptionBits(kIOHIDOptionsTypeNone))
         guard r == kIOReturnSuccess else {
@@ -239,7 +298,17 @@ public final class DimensionPad {
 
         IOHIDDeviceScheduleWithRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
-        print("Input callback registered + INIT sent.")
+        Task { @MainActor in
+            await self.refreshPresentTagsFromList()
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            await self.refreshPresentTagsFromList()
+        }
+
+        if debugLoggingEnabled {
+            print("Input callback registered + INIT sent.")
+        }
     }
 
     private func deviceRemoved(_ dev: IOHIDDevice) {
@@ -248,7 +317,9 @@ public final class DimensionPad {
             device = nil
             connected = false
             resetPads()
-            print("Device removed.")
+            if debugLoggingEnabled {
+                print("Device removed.")
+            }
         }
     }
 
@@ -256,7 +327,54 @@ public final class DimensionPad {
         bytes.withUnsafeBytes { raw in
             let ptr = raw.bindMemory(to: UInt8.self).baseAddress!
             let r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, reportID, ptr, bytes.count)
-            print(r == kIOReturnSuccess ? "OUT ✅ \(bytes.count) bytes" : "OUT ❌ \(r)")
+            if debugLoggingEnabled {
+                print(r == kIOReturnSuccess ? "OUT ✅ \(bytes.count) bytes" : "OUT ❌ \(r)")
+            }
+        }
+    }
+
+    private func refreshPresentTagsFromList() async {
+        guard let dev = self.device else { return }
+        for attempt in 0..<4 {
+            do {
+                let msg = try nextMsgAvailable()
+                let payload = try await request55(
+                    kind: .tagList,
+                    dev: dev,
+                    cmd: createTagListCommand(msg: msg)
+                )
+
+                let entries = parseTagList(payload)
+                if entries.isEmpty && attempt < 3 {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    continue
+                }
+
+                for (pad, index) in entries {
+                    let tagIndex = index
+                    let data16 = try await readPages(tagIndex: tagIndex, startPage: 0x00)
+                    guard data16.count >= 8 else { continue }
+                    let uid: [UInt8] = [data16[0], data16[1], data16[2], data16[4], data16[5], data16[6], data16[7]]
+                    let signature = signatureString(uid)
+                    let key = TagSlotKey(pad: pad, index: tagIndex)
+
+                    if presentTagBySlot[key]?.signature != signature {
+                        presentTagBySlot[key] = PresentTag(uid: uid, signature: signature, index: tagIndex)
+                        publishPad(pad, present: true, uid: signature, characterID: nil, name: nil, world: nil)
+                        Task { @MainActor in
+                            await resolveNameForPad(pad: pad, signature: signature)
+                        }
+                        events.send(TagEvent(action: .add, pad: pad, signature: signature, index: tagIndex, uid: uid))
+                    }
+                }
+                break
+            } catch {
+                if attempt < 3 {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    continue
+                }
+                break
+            }
         }
     }
 
@@ -288,7 +406,9 @@ public final class DimensionPad {
         let action = b[5]
         let uid = Array(b[6...12]) // 7 bytes
 
-        print("TAG \(hex(b))")
+        if debugLoggingEnabled {
+            print("TAG \(hex(b))")
+        }
 
         return TagEv(pad: pad, index: index, action: action, uid: uid)
     }
@@ -299,10 +419,13 @@ public final class DimensionPad {
         switch ev.action {
         case 0: // inserted
             // Only log/publish if this is a new UID for that pad
-            if presentTagByPad[ev.pad.rawValue]?.signature != signature {
-                presentTagByPad[ev.pad.rawValue] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
-                print("✅ \(ev.pad.rawValue) inserted uid=\(signature)")
-                publishPad(ev.pad, present: true, uid: signature, characterID: nil, name: nil)
+            let key = TagSlotKey(pad: ev.pad, index: ev.index)
+            if presentTagBySlot[key]?.signature != signature {
+                presentTagBySlot[key] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
+                if debugLoggingEnabled {
+                    print("✅ \(ev.pad.rawValue) inserted uid=\(signature)")
+                }
+                publishPad(ev.pad, present: true, uid: signature, characterID: nil, name: nil, world: nil)
                 Task { @MainActor in
                     await resolveNameForPad(pad: ev.pad, signature: signature)
                 }
@@ -311,10 +434,13 @@ public final class DimensionPad {
 
         case 1: // removed
             // Only log/publish if something was present
-            if let removed = presentTagByPad[ev.pad.rawValue] {
-                presentTagByPad[ev.pad.rawValue] = nil
-                print("❌ \(ev.pad.rawValue) removed")
-                publishPad(ev.pad, present: false, uid: removed.signature, characterID: nil, name: nil)
+            let key = TagSlotKey(pad: ev.pad, index: ev.index)
+            if let removed = presentTagBySlot[key] {
+                presentTagBySlot[key] = nil
+                if debugLoggingEnabled {
+                    print("❌ \(ev.pad.rawValue) removed")
+                }
+                publishPad(ev.pad, present: false, uid: removed.signature, characterID: nil, name: nil, world: nil)
                 events.send(TagEvent(action: .remove, pad: ev.pad, signature: removed.signature, index: removed.index, uid: removed.uid))
             }
 
@@ -388,7 +514,9 @@ public final class DimensionPad {
         }
 
         // Debug what we actually got (helps when status != 0 or payload is short)
-        print("IN55 len=\(len) msg=\(frame.msg) payloadLen=\(frame.payload.count) payload=\(hex(frame.payload))")
+        if debugLoggingEnabled {
+            print("IN55 len=\(len) msg=\(frame.msg) payloadLen=\(frame.payload.count) payload=\(hex(frame.payload))")
+        }
 
         switch pending.kind {
         case .other:
@@ -415,25 +543,47 @@ public final class DimensionPad {
             let data16 = Array(frame.payload[1..<(1 + 16)])
             pending.continuation.resume(returning: data16)
             return true
+
+        case .tagList:
+            pending.continuation.resume(returning: frame.payload)
+            return true
         }
     }
     
     private func readPages(padByte: UInt8, startPage: UInt8) async throws -> [UInt8] {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
-
-        guard let tag = presentTagByPad[padByte] else { throw ToyPadReadError.tagNotPresent }
+        guard let pad = Pad(rawValue: padByte), let tag = firstTag(for: pad) else {
+            throw ToyPadReadError.tagNotPresent
+        }
         let index = tag.index
         let msg = try nextMsgAvailable()
-        print("D2 READ msg=\(msg) pad=\(padByte) index=\(index) page=\(String(format:"%02X", startPage))")
+        if debugLoggingEnabled {
+            print("D2 READ msg=\(msg) pad=\(padByte) index=\(index) page=\(String(format:"%02X", startPage))")
+        }
 
-        // cmd: 55 04 D2 <msg> <index> <page>
         let data16 = try await request55(
             kind: .readPages,
             dev: dev,
             cmd: createReadTagCommand(msg: msg, index: index, page: startPage)
         )
 
-        // handle55Response(.readPages) liefert bereits nur die 16 Datenbytes
+        guard data16.count == 16 else { throw ToyPadReadError.malformedResponse }
+        return data16
+    }
+
+    private func readPages(tagIndex: UInt8, startPage: UInt8) async throws -> [UInt8] {
+        guard let dev = self.device else { throw ToyPadReadError.notConnected }
+        let msg = try nextMsgAvailable()
+        if debugLoggingEnabled {
+            print("D2 READ msg=\(msg) index=\(tagIndex) page=\(String(format:"%02X", startPage))")
+        }
+
+        let data16 = try await request55(
+            kind: .readPages,
+            dev: dev,
+            cmd: createReadTagCommand(msg: msg, index: tagIndex, page: startPage)
+        )
+
         guard data16.count == 16 else { throw ToyPadReadError.malformedResponse }
         return data16
     }
@@ -471,8 +621,8 @@ public final class DimensionPad {
     }
 
     private func resetPads() {
-        presentTagByPad.removeAll()
-        pads = PadSlots(center: PadState(present: false, uid: nil, characterID: nil, name: nil))
+        presentTagBySlot.removeAll()
+        pads = PadSlots(center: PadState(present: false, uid: nil, characterID: nil, name: nil, world: nil))
     }
 
     private func switchPad(_ dev: IOHIDDevice, pad: Pad, r: UInt8, g: UInt8, b: UInt8) {
@@ -491,10 +641,12 @@ public final class DimensionPad {
         message.withUnsafeBytes { raw in
             let ptr = raw.bindMemory(to: UInt8.self).baseAddress!
             let r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, 0, ptr, message.count)
-            if r == kIOReturnSuccess {
-                print("⬆️ OUT \(message.count) bytes cmd=\(cmd.map{String(format:"%02X",$0)}.joined(separator:" "))")
-            } else {
-                print("IOHIDDeviceSetReport failed: \(r)")
+            if debugLoggingEnabled {
+                if r == kIOReturnSuccess {
+                    print("⬆️ OUT \(message.count) bytes cmd=\(cmd.map{String(format:"%02X",$0)}.joined(separator:" "))")
+                } else {
+                    print("IOHIDDeviceSetReport failed: \(r)")
+                }
             }
         }
     }
