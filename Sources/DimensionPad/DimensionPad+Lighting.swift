@@ -3,7 +3,7 @@ import IOKit.hid
 
 extension DimensionPad {
     /// Set the RGB LED color for a pad, or all pads
-    public func setColor(pad: Pad, r: UInt8, g: UInt8, b: UInt8) async throws {
+    public func setColor(pad: Pad, r: UInt8, g: UInt8, b: UInt8) throws {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
         let msg = try nextMsgAvailable()
         let cmd = createSetColorCommand(msg: msg, pad: pad.rawValue, r: r, g: g, b: b)
@@ -11,7 +11,7 @@ extension DimensionPad {
     }
 
     /// Flash a single pad with a color pattern.
-    public func flash(pad: Pad, flashPad: FlashPad) async throws {
+    public func flash(pad: Pad, flashPad: FlashPad) throws {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
         let msg = try nextMsgAvailable()
         let cmd = createFlashCommand(
@@ -42,7 +42,7 @@ extension DimensionPad {
     }
 
     /// Flash all pads with independent patterns.
-    public func flashAll(center: FlashPad, left: FlashPad, right: FlashPad) async throws {
+    public func flashAll(center: FlashPad, left: FlashPad, right: FlashPad) throws {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
         let msg = try nextMsgAvailable()
         let cmd = createFlashAllCommand(msg: msg, center: center, left: left, right: right)
@@ -50,7 +50,7 @@ extension DimensionPad {
     }
 
     /// Fade a single pad with a color transition.
-    public func fade(pad: Pad, fadePad: FadePad) async throws {
+    public func fade(pad: Pad, fadePad: FadePad) throws {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
         let msg = try nextMsgAvailable()
         let cmd = createFadeCommand(
@@ -73,13 +73,13 @@ extension DimensionPad {
         r: UInt8,
         g: UInt8,
         b: UInt8
-    ) async throws {
+    ) throws {
         let fadePad = FadePad(tickTime: tickTime, tickCount: tickCount, r: r, g: g, b: b)
-        try await fade(pad: pad, fadePad: fadePad)
+        try fade(pad: pad, fadePad: fadePad)
     }
 
     /// Fade all pads with independent patterns.
-    public func fadeAll(center: FadePad, left: FadePad, right: FadePad) async throws {
+    public func fadeAll(center: FadePad, left: FadePad, right: FadePad) throws {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
         let msg = try nextMsgAvailable()
         let cmd = createFadeAllCommand(msg: msg, center: center, left: left, right: right)
@@ -87,7 +87,7 @@ extension DimensionPad {
     }
 
     /// Fade to random colors on a pad.
-    public func fadeRandom(pad: Pad, tickTime: UInt8, tickCount: UInt8) async throws {
+    public func fadeRandom(pad: Pad, tickTime: UInt8, tickCount: UInt8) throws {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
         let msg = try nextMsgAvailable()
         let cmd = createFadeRandomCommand(msg: msg, pad: pad.rawValue, tickTime: tickTime, tickCount: tickCount)
