@@ -56,12 +56,14 @@ public enum DimensionPadMetadata {
 
     private static func loadArray<T: Decodable>(_ name: String, as type: T.Type) -> [T] {
         guard let url = Bundle.module.url(forResource: name, withExtension: "json") else {
+            print("DimensionPadMetadata: missing resource \(name).json")
             return []
         }
         do {
             let data = try Data(contentsOf: url)
             return try JSONDecoder().decode([T].self, from: data)
         } catch {
+            print("DimensionPadMetadata: failed to load \(name).json: \(error)")
             return []
         }
     }
