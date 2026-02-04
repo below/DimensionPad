@@ -73,6 +73,7 @@ public final class DimensionPad {
         case malformedResponse
         case deviceError(status: UInt8)
         case checksumMismatch
+        case busy
     }
     
     private let manager: IOHIDManager
@@ -251,10 +252,14 @@ public final class DimensionPad {
 
     private func deviceRemoved(_ dev: IOHIDDevice) {
         if let current = device, CFEqual(current, dev) {
+            let pendingContinuations = pending55.values
             pending55.removeAll()
             device = nil
             connected = false
             print("Device removed.")
+            for pending in pendingContinuations {
+                pending.continuation.resume(throwing: ToyPadReadError.notConnected)
+            }
         }
     }
 
@@ -449,6 +454,7 @@ public final class DimensionPad {
         // cmd must already include the leading 0x55, length, opcode, msg, ...
         guard cmd.count >= 4, cmd[0] == 0x55 else { throw ToyPadReadError.malformedResponse }
         let msg = cmd[3]
+        guard pending55[msg] == nil else { throw ToyPadReadError.busy }
 
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[UInt8], Error>) in
             pending55[msg] = Pending55(kind: kind, continuation: cont)
@@ -599,4 +605,3 @@ public final class DimensionPad {
         return (v0, v1)
     }
 }
-
