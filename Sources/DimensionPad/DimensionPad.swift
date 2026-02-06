@@ -24,6 +24,12 @@ public final class DimensionPad {
         case deviceError(status: UInt8)
         case checksumMismatch
         case busy
+        case invalidWriteDataLength
+        case invalidPasswordLength
+        case ambiguousTagSelection
+        case notVehicleTag
+        case unknownVehicle
+        case invalidVehicleStep
     }
     
     private let manager: IOHIDManager
@@ -71,6 +77,12 @@ public final class DimensionPad {
         let uid: [UInt8]
         let signature: String
         let index: UInt8
+    }
+
+    private enum PortalPasswordMode: UInt8 {
+        case disable = 0
+        case automatic = 1
+        case custom = 2
     }
 
     private struct TagSlotKey: Hashable {
@@ -135,6 +147,54 @@ public final class DimensionPad {
         }
     }
 
+    /// Write a 16-byte block to a tag page (writes 4 pages starting at `page`).
+    /// If there are multiple tags on `pad`, provide `signature` to select one.
+    public func writeTagBlock(
+        pad: Pad,
+        page: UInt8,
+        data16: [UInt8],
+        signature: String? = nil
+    ) async throws {
+        guard pad != .all else { throw ToyPadReadError.tagNotPresent }
+        let tag = try resolveTagForWrite(pad: pad, signature: signature)
+        try await writePages(tagIndex: tag.index, startPage: page, data16: data16)
+    }
+
+    /// Program a vehicle tag payload on page `0x24`.
+    /// If `step` is omitted, it is derived from the passed `vehicleID` variant.
+    /// If there are multiple tags on `pad`, provide `signature` to select one.
+    public func writeVehicle(
+        pad: Pad,
+        vehicleID: Int,
+        step: Int? = nil,
+        signature: String? = nil
+    ) async throws {
+        try await writeVehicleInternal(
+            pad: pad,
+            vehicleID: vehicleID,
+            step: step,
+            signature: signature,
+            requireExistingVehicleTag: true
+        )
+    }
+
+    /// Initialize a blank/unknown tag as a vehicle by writing a vehicle payload to page `0x24`.
+    /// This intentionally skips the "must already be a vehicle tag" precheck.
+    public func initializeBlankVehicle(
+        pad: Pad,
+        vehicleID: Int,
+        step: Int? = nil,
+        signature: String? = nil
+    ) async throws {
+        try await writeVehicleInternal(
+            pad: pad,
+            vehicleID: vehicleID,
+            step: step,
+            signature: signature,
+            requireExistingVehicleTag: false
+        )
+    }
+
     private func readTagInfo(pad: Pad, signature: String) async throws -> TagInfo {
         guard pad != .all else { throw ToyPadReadError.tagNotPresent }
         guard let tag = tagFor(pad: pad, signature: signature) else { throw ToyPadReadError.tagNotPresent }
@@ -154,6 +214,58 @@ public final class DimensionPad {
         case .unknown:
             return TagInfo(type: .unknown, id: 0, signature: tag.signature)
         }
+    }
+
+    private func writeVehicleInternal(
+        pad: Pad,
+        vehicleID: Int,
+        step: Int?,
+        signature: String?,
+        requireExistingVehicleTag: Bool
+    ) async throws {
+        guard pad != .all else { throw ToyPadReadError.tagNotPresent }
+        let tag = try resolveTagForWrite(pad: pad, signature: signature)
+
+        if requireExistingVehicleTag {
+            let info = try await readTagInfo(pad: pad, signature: tag.signature)
+            guard info.type == .vehicle else { throw ToyPadReadError.notVehicleTag }
+        }
+
+        let variant = try resolveVehicleVariant(vehicleID: vehicleID, step: step)
+        let payload = createVehiclePayload(vehicleID: variant.id, step: variant.step)
+
+        // Some blank/generic tags reject writes while the portal is in automatic password mode.
+        // For blank initialization we temporarily disable password handling on the target index.
+        if !requireExistingVehicleTag {
+            await setTagPasswordBestEffort(mode: .disable, index: tag.index)
+        }
+
+        do {
+            try await writePages(tagIndex: tag.index, startPage: 0x24, data16: payload)
+        } catch {
+            if !requireExistingVehicleTag {
+                await setTagPasswordBestEffort(mode: .automatic, index: tag.index)
+            }
+            throw error
+        }
+
+        // Some generic/blank tags acknowledge 16-byte writes but only persist the first 4 bytes.
+        // Verify and force 4-byte page writes when the readback does not match the desired payload.
+        let readback = try await readPages(tagIndex: tag.index, startPage: 0x24)
+        if readback != payload {
+            if debugLoggingEnabled {
+                print("Write verify mismatch at page 0x24; forcing 4-byte page writes.")
+                print("Expected: \(hex(payload))")
+                print("Actual  : \(hex(readback))")
+            }
+            try await writePagesInChunks(tagIndex: tag.index, startPage: 0x24, data16: payload)
+        }
+
+        if !requireExistingVehicleTag {
+            await setTagPasswordBestEffort(mode: .automatic, index: tag.index)
+        }
+
+        await resolveNameForPad(pad: pad, signature: tag.signature)
     }
 
     private func resolveNameForPad(pad: Pad, signature: String) async {
@@ -237,6 +349,30 @@ public final class DimensionPad {
 
     private func tagFor(pad: Pad, signature: String) -> PresentTag? {
         return presentTagBySlot.first { $0.key.pad == pad && $0.value.signature == signature }?.value
+    }
+
+    private func tags(for pad: Pad) -> [PresentTag] {
+        presentTagBySlot
+            .filter { $0.key.pad == pad }
+            .map(\.value)
+    }
+
+    private func resolveTagForWrite(pad: Pad, signature: String?) throws -> PresentTag {
+        if let signature {
+            guard let tag = tagFor(pad: pad, signature: signature) else {
+                throw ToyPadReadError.tagNotPresent
+            }
+            return tag
+        }
+
+        let entries = tags(for: pad)
+        guard !entries.isEmpty else {
+            throw ToyPadReadError.tagNotPresent
+        }
+        guard entries.count == 1 else {
+            throw ToyPadReadError.ambiguousTagSelection
+        }
+        return entries[0]
     }
 
     private func parseTagList(_ payload: [UInt8]) -> [(Pad, UInt8)] {
@@ -550,27 +686,6 @@ public final class DimensionPad {
         }
     }
     
-    private func readPages(padByte: UInt8, startPage: UInt8) async throws -> [UInt8] {
-        guard let dev = self.device else { throw ToyPadReadError.notConnected }
-        guard let pad = Pad(rawValue: padByte), let tag = firstTag(for: pad) else {
-            throw ToyPadReadError.tagNotPresent
-        }
-        let index = tag.index
-        let msg = try nextMsgAvailable()
-        if debugLoggingEnabled {
-            print("D2 READ msg=\(msg) pad=\(padByte) index=\(index) page=\(String(format:"%02X", startPage))")
-        }
-
-        let data16 = try await request55(
-            kind: .readPages,
-            dev: dev,
-            cmd: createReadTagCommand(msg: msg, index: index, page: startPage)
-        )
-
-        guard data16.count == 16 else { throw ToyPadReadError.malformedResponse }
-        return data16
-    }
-
     private func readPages(tagIndex: UInt8, startPage: UInt8) async throws -> [UInt8] {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
         let msg = try nextMsgAvailable()
@@ -586,6 +701,89 @@ public final class DimensionPad {
 
         guard data16.count == 16 else { throw ToyPadReadError.malformedResponse }
         return data16
+    }
+
+    private func writePages(tagIndex: UInt8, startPage: UInt8, data16: [UInt8]) async throws {
+        guard let dev = self.device else { throw ToyPadReadError.notConnected }
+        guard data16.count == 16 else { throw ToyPadReadError.invalidWriteDataLength }
+        let msg = try nextMsgAvailable()
+        if debugLoggingEnabled {
+            print("D3 WRITE msg=\(msg) index=\(tagIndex) page=\(String(format:"%02X", startPage)) data=\(hex(data16))")
+        }
+
+        do {
+            let payload = try await request55(
+                kind: .other,
+                dev: dev,
+                cmd: createWriteTagCommand(msg: msg, index: tagIndex, page: startPage, data16: data16)
+            )
+
+            guard let status = payload.first else { throw ToyPadReadError.malformedResponse }
+            guard status == 0 else { throw ToyPadReadError.deviceError(status: status) }
+        } catch ToyPadReadError.deviceError(let status) where status == 0xF2 {
+            // Compatibility fallback: some tags only accept 4-byte Ultralight writes.
+            try await writePagesInChunks(tagIndex: tagIndex, startPage: startPage, data16: data16)
+        }
+    }
+
+    private func writePagesInChunks(tagIndex: UInt8, startPage: UInt8, data16: [UInt8]) async throws {
+        guard let dev = self.device else { throw ToyPadReadError.notConnected }
+        guard data16.count == 16 else { throw ToyPadReadError.invalidWriteDataLength }
+
+        for chunkIndex in 0..<4 {
+            let offset = chunkIndex * 4
+            let page = startPage &+ UInt8(chunkIndex)
+            let chunk = Array(data16[offset..<(offset + 4)])
+            let msg = try nextMsgAvailable()
+            if debugLoggingEnabled {
+                print("D3 WRITE(4B) msg=\(msg) index=\(tagIndex) page=\(String(format:"%02X", page)) data=\(hex(chunk))")
+            }
+
+            let payload = try await request55(
+                kind: .other,
+                dev: dev,
+                cmd: createWriteTagCommand4(msg: msg, index: tagIndex, page: page, data4: chunk)
+            )
+
+            guard let status = payload.first else { throw ToyPadReadError.malformedResponse }
+            guard status == 0 else { throw ToyPadReadError.deviceError(status: status) }
+        }
+    }
+
+    private func setTagPassword(mode: PortalPasswordMode, index: UInt8, customPassword: [UInt8] = [0, 0, 0, 0]) async throws {
+        guard let dev = self.device else { throw ToyPadReadError.notConnected }
+        guard customPassword.count == 4 else { throw ToyPadReadError.invalidPasswordLength }
+        let msg = try nextMsgAvailable()
+
+        let payload = try await request55(
+            kind: .other,
+            dev: dev,
+            cmd: createSetTagPasswordCommand(msg: msg, mode: mode.rawValue, index: index, customPassword: customPassword)
+        )
+
+        guard let status = payload.first else { throw ToyPadReadError.malformedResponse }
+        if status == 0 {
+            return
+        }
+        // Some portals/tags reject switching back to automatic password mode even after a successful write.
+        // Treat this as non-fatal so blank-tag initialization can proceed.
+        if mode == .automatic, status == 0xF0 {
+            if debugLoggingEnabled {
+                print("E1 automatic returned F0 on index \(index); continuing.")
+            }
+            return
+        }
+        throw ToyPadReadError.deviceError(status: status)
+    }
+
+    private func setTagPasswordBestEffort(mode: PortalPasswordMode, index: UInt8) async {
+        do {
+            try await setTagPassword(mode: mode, index: index)
+        } catch {
+            if debugLoggingEnabled {
+                print("E1 \(mode.rawValue) best-effort failed on index \(index): \(error)")
+            }
+        }
     }
 
     /// Send a 0x55 command frame and await the 0x55 response payload (without checksum).
@@ -662,6 +860,24 @@ public final class DimensionPad {
 
     private func createReadTagCommand(msg: UInt8, index: UInt8, page: UInt8) -> [UInt8] {
         [0x55, 0x04, 0xD2, msg, index, page]
+    }
+
+    private func createWriteTagCommand(msg: UInt8, index: UInt8, page: UInt8, data16: [UInt8]) -> [UInt8] {
+        var cmd: [UInt8] = [0x55, 0x14, 0xD3, msg, index, page]
+        cmd.append(contentsOf: data16)
+        return cmd
+    }
+
+    private func createWriteTagCommand4(msg: UInt8, index: UInt8, page: UInt8, data4: [UInt8]) -> [UInt8] {
+        var cmd: [UInt8] = [0x55, 0x08, 0xD3, msg, index, page]
+        cmd.append(contentsOf: data4)
+        return cmd
+    }
+
+    private func createSetTagPasswordCommand(msg: UInt8, mode: UInt8, index: UInt8, customPassword: [UInt8]) -> [UInt8] {
+        var cmd: [UInt8] = [0x55, 0x08, 0xE1, msg, mode, index]
+        cmd.append(contentsOf: customPassword)
+        return cmd
     }
 
     // MARK: General Utilities
@@ -757,5 +973,72 @@ public final class DimensionPad {
             sum = sum &- delta
         }
         return (v0, v1)
+    }
+
+    private struct VehicleVariant {
+        let id: Int
+        let step: Int
+    }
+
+    private func resolveVehicleVariant(vehicleID: Int, step: Int?) throws -> VehicleVariant {
+        let all = DimensionPadMetadata.listVehicles()
+        guard !all.isEmpty else { throw ToyPadReadError.unknownVehicle }
+
+        if let step {
+            guard step >= 0 else { throw ToyPadReadError.invalidVehicleStep }
+            guard let selected = DimensionPadMetadata.getVehicleById(vehicleID) else {
+                throw ToyPadReadError.unknownVehicle
+            }
+            let rootID = selected.parentId ?? selected.id
+            let variants = all
+                .filter { $0.id == rootID || $0.parentId == rootID }
+                .sorted {
+                    let lhsBase = $0.id == rootID ? 0 : 1
+                    let rhsBase = $1.id == rootID ? 0 : 1
+                    if lhsBase != rhsBase { return lhsBase < rhsBase }
+                    return $0.id < $1.id
+                }
+
+            guard step < variants.count else { throw ToyPadReadError.invalidVehicleStep }
+            return VehicleVariant(id: variants[step].id, step: step)
+        }
+
+        guard let selected = DimensionPadMetadata.getVehicleById(vehicleID) else {
+            throw ToyPadReadError.unknownVehicle
+        }
+        let rootID = selected.parentId ?? selected.id
+        let variants = all
+            .filter { $0.id == rootID || $0.parentId == rootID }
+            .sorted {
+                let lhsBase = $0.id == rootID ? 0 : 1
+                let rhsBase = $1.id == rootID ? 0 : 1
+                if lhsBase != rhsBase { return lhsBase < rhsBase }
+                return $0.id < $1.id
+            }
+        let stepIndex = variants.firstIndex { $0.id == selected.id } ?? 0
+        return VehicleVariant(id: selected.id, step: stepIndex)
+    }
+
+    private func createVehiclePayload(vehicleID: Int, step: Int) -> [UInt8] {
+        let normalizedID = UInt32(clamping: vehicleID)
+        var payload = [UInt8](repeating: 0x00, count: 16)
+        payload[0] = UInt8(normalizedID & 0xFF)
+        payload[1] = UInt8((normalizedID >> 8) & 0xFF)
+        payload[2] = UInt8((normalizedID >> 16) & 0xFF)
+        payload[3] = UInt8((normalizedID >> 24) & 0xFF)
+        payload[9] = 0x01
+        payload[12] = upgradeFlag(step: step)
+        return payload
+    }
+
+    private func upgradeFlag(step: Int) -> UInt8 {
+        switch step {
+        case 1:
+            return 0x04
+        case 2:
+            return 0x08
+        default:
+            return 0x00
+        }
     }
 }

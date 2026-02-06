@@ -6,6 +6,7 @@ It provides:
 - Device discovery and connection management.
 - Tag add/remove events with UID and panel.
 - Tag reads (including character/vehicle ID decoding).
+- Tag writing (generic block write and vehicle programming).
 - Metadata lookup (character/vehicle names/vehicles/worlds).
 - Basic LED control.
 
@@ -139,6 +140,27 @@ try await pad.fadeAll(center: fadeCenter, left: fadeLeft, right: fadeRight)
 
 // Fade to random colors
 try await pad.fadeRandom(pad: .right, tickTime: 16, tickCount: 10)
+```
+
+## Writing
+
+```swift
+// Write 16 bytes (4 pages) starting at page 0x24.
+// If multiple tags are on the same pad, pass signature: "...".
+try await pad.writeTagBlock(
+    pad: .center,
+    page: 0x24,
+    data16: [UInt8](repeating: 0, count: 16)
+)
+
+// Program a vehicle payload on an existing vehicle tag.
+try await pad.writeVehicle(pad: .center, vehicleID: 1000)
+
+// Initialize a blank/unknown tag as a vehicle (skips vehicle precheck).
+try await pad.initializeBlankVehicle(pad: .center, vehicleID: 1006, step: 0)
+
+// Program a specific rebuild step variant (0 = base, 1/2 = upgrades where available).
+try await pad.writeVehicle(pad: .center, vehicleID: 1000, step: 1)
 ```
 
 ## Notes
