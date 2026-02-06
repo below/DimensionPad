@@ -2,67 +2,17 @@ import Foundation
 import Combine
 import IOKit.hid
 
-/// Type of LEGO Dimensions NFC tag payload.
-public enum TagType {
-    case character
-    case vehicle
-    case unknown
-}
-
-/// Basic decoded tag information.
-public struct TagInfo {
-    public let type: TagType
-    public let id: Int
-    public let signature: String
-}
-
-/// Published state for a single pad.
-public struct PadState: Sendable {
-    public let present: Bool
-    public let uid: String?
-    public let name: String?
-
-    /// Creates a new pad state.
-    public init(present: Bool, uid: String?, name: String?) {
-        self.present = present
-        self.uid = uid
-        self.name = name
-    }
-}
-
-public enum Pad: UInt8, Sendable {
-    case all = 0
-    case center = 1
-    case left = 2
-    case right = 3
-    
-}
-
-/// Event emitted when a tag is added or removed.
-public struct TagEvent: Sendable {
-    public enum Action: Sendable {
-        case add
-        case remove
-    }
-
-    public let action: Action
-    public let pad: Pad
-    public let signature: String
-    public let index: UInt8
-    public let uid: [UInt8]
-}
-
 /// HID-backed interface to the LEGO Dimensions Toy Pad.
 @MainActor
 public final class DimensionPad {
     /// Connection state for the HID device.
     @Published public private(set) var connected: Bool = false
     /// Per-pad state (presence, UID, resolved name).
-    @Published public private(set) var pads: [UInt8: PadState] = [
-        1: PadState(present: false, uid: nil, name: nil),
-        2: PadState(present: false, uid: nil, name: nil),
-        3: PadState(present: false, uid: nil, name: nil)
-    ]
+    @Published public private(set) var pads = PadSlots(
+        center: PadState(present: false, uid: nil, characterID: nil, name: nil, world: nil),
+        left: [],
+        right: []
+    )
     /// Tag add/remove events emitted by the Toy Pad.
     public let events = PassthroughSubject<TagEvent, Never>()
 
@@ -74,6 +24,12 @@ public final class DimensionPad {
         case deviceError(status: UInt8)
         case checksumMismatch
         case busy
+        case invalidWriteDataLength
+        case invalidPasswordLength
+        case ambiguousTagSelection
+        case notVehicleTag
+        case unknownVehicle
+        case invalidVehicleStep
     }
     
     private let manager: IOHIDManager
@@ -90,16 +46,23 @@ public final class DimensionPad {
     ]
 
     private var inputReport = [UInt8](repeating: 0, count: 32)
+    private let debugLoggingEnabled = ProcessInfo.processInfo.environment["DIMENSIONPAD_DEBUG_LOGS"] == "1"
 
     internal var msgCounter: UInt8 = 0x01
-    private func nextMsg() -> UInt8 {
-        let m = msgCounter
-        msgCounter &+= 1
-        return m
+    func nextMsgAvailable() throws -> UInt8 {
+        for _ in 0..<256 {
+            let m = msgCounter
+            msgCounter &+= 1
+            if pending55[m] == nil {
+                return m
+            }
+        }
+        throw ToyPadReadError.malformedResponse
     }
 
     internal enum PendingKind {
         case readPages
+        case tagList
         case other
     }
 
@@ -116,7 +79,19 @@ public final class DimensionPad {
         let index: UInt8
     }
 
-    private var presentTagByPad: [UInt8: PresentTag] = [:]
+    private enum PortalPasswordMode: UInt8 {
+        case disable = 0
+        case automatic = 1
+        case custom = 2
+    }
+
+    private struct TagSlotKey: Hashable {
+        let pad: Pad
+        let index: UInt8
+    }
+
+    private var presentTagBySlot: [TagSlotKey: PresentTag] = [:]
+    private var isManagerConfigured = false
 
     public init() {
         self.manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(0))
@@ -124,6 +99,8 @@ public final class DimensionPad {
     
     /// Start  discovery and connect to the Toy Pad if present.
     public func connect() {
+        guard !isManagerConfigured else { return }
+        isManagerConfigured = true
         let matching: [String: Any] = [
             kIOHIDVendorIDKey as String: vendorID,
             kIOHIDProductIDKey as String: productID
@@ -143,14 +120,16 @@ public final class DimensionPad {
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
         let r = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        print(r == kIOReturnSuccess ? "HID manager open ✅" : "HID manager open ❌ \(r)")
+        if debugLoggingEnabled {
+            print(r == kIOReturnSuccess ? "HID manager open ✅" : "HID manager open ❌ \(r)")
+        }
     }
  
     /// Read and decode tag information for a given pad
     public func readTagInfo(pad: Pad) async throws -> TagInfo {
         guard pad != .all else { throw ToyPadReadError.tagNotPresent }
-        guard let tag = presentTagByPad[pad.rawValue] else { throw ToyPadReadError.tagNotPresent }
-        let block = try await readPages(padByte: pad.rawValue, startPage: 0x24)
+        guard let tag = firstTag(for: pad) else { throw ToyPadReadError.tagNotPresent }
+        let block = try await readPages(tagIndex: tag.index, startPage: 0x24)
         guard block.count >= 16 else { throw ToyPadReadError.malformedResponse }
 
         let payloadView = Array(block[8..<12])
@@ -168,44 +147,250 @@ public final class DimensionPad {
         }
     }
 
-    /// Set the RGB LED color for a pad, or all pads
-    public func setColor(pad: Pad, r: UInt8, g: UInt8, b: UInt8) async throws {
-        guard let dev = self.device else { throw ToyPadReadError.notConnected }
-        let msg = nextMsg()
-        let cmd = createSetColorCommand(msg: msg, pad: pad.rawValue, r: r, g: g, b: b)
-        _ = try await request55(kind: .other, dev: dev, cmd: cmd)
+    /// Write a 16-byte block to a tag page (writes 4 pages starting at `page`).
+    /// If there are multiple tags on `pad`, provide `signature` to select one.
+    public func writeTagBlock(
+        pad: Pad,
+        page: UInt8,
+        data16: [UInt8],
+        signature: String? = nil
+    ) async throws {
+        guard pad != .all else { throw ToyPadReadError.tagNotPresent }
+        let tag = try resolveTagForWrite(pad: pad, signature: signature)
+        try await writePages(tagIndex: tag.index, startPage: page, data16: data16)
+    }
+
+    /// Program a vehicle tag payload on page `0x24`.
+    /// If `step` is omitted, it is derived from the passed `vehicleID` variant.
+    /// If there are multiple tags on `pad`, provide `signature` to select one.
+    public func writeVehicle(
+        pad: Pad,
+        vehicleID: Int,
+        step: Int? = nil,
+        signature: String? = nil
+    ) async throws {
+        try await writeVehicleInternal(
+            pad: pad,
+            vehicleID: vehicleID,
+            step: step,
+            signature: signature,
+            requireExistingVehicleTag: true
+        )
+    }
+
+    /// Initialize a blank/unknown tag as a vehicle by writing a vehicle payload to page `0x24`.
+    /// This intentionally skips the "must already be a vehicle tag" precheck.
+    public func initializeBlankVehicle(
+        pad: Pad,
+        vehicleID: Int,
+        step: Int? = nil,
+        signature: String? = nil
+    ) async throws {
+        try await writeVehicleInternal(
+            pad: pad,
+            vehicleID: vehicleID,
+            step: step,
+            signature: signature,
+            requireExistingVehicleTag: false
+        )
+    }
+
+    private func readTagInfo(pad: Pad, signature: String) async throws -> TagInfo {
+        guard pad != .all else { throw ToyPadReadError.tagNotPresent }
+        guard let tag = tagFor(pad: pad, signature: signature) else { throw ToyPadReadError.tagNotPresent }
+        let block = try await readPages(tagIndex: tag.index, startPage: 0x24)
+        guard block.count >= 16 else { throw ToyPadReadError.malformedResponse }
+
+        let payloadView = Array(block[8..<12])
+        let type = detectTagType(payloadView)
+        switch type {
+        case .vehicle:
+            let id = getVehicleId(block)
+            return TagInfo(type: .vehicle, id: id, signature: tag.signature)
+        case .character:
+            let encrypted = Array(block[0..<8])
+            let id = getCharacterId(uid: tag.uid, encrypted: encrypted)
+            return TagInfo(type: .character, id: id, signature: tag.signature)
+        case .unknown:
+            return TagInfo(type: .unknown, id: 0, signature: tag.signature)
+        }
+    }
+
+    private func writeVehicleInternal(
+        pad: Pad,
+        vehicleID: Int,
+        step: Int?,
+        signature: String?,
+        requireExistingVehicleTag: Bool
+    ) async throws {
+        guard pad != .all else { throw ToyPadReadError.tagNotPresent }
+        let tag = try resolveTagForWrite(pad: pad, signature: signature)
+
+        if requireExistingVehicleTag {
+            let info = try await readTagInfo(pad: pad, signature: tag.signature)
+            guard info.type == .vehicle else { throw ToyPadReadError.notVehicleTag }
+        }
+
+        let variant = try resolveVehicleVariant(vehicleID: vehicleID, step: step)
+        let payload = createVehiclePayload(vehicleID: variant.id, step: variant.step)
+
+        // Some blank/generic tags reject writes while the portal is in automatic password mode.
+        // For blank initialization we temporarily disable password handling on the target index.
+        if !requireExistingVehicleTag {
+            await setTagPasswordBestEffort(mode: .disable, index: tag.index)
+        }
+
+        do {
+            try await writePages(tagIndex: tag.index, startPage: 0x24, data16: payload)
+        } catch {
+            if !requireExistingVehicleTag {
+                await setTagPasswordBestEffort(mode: .automatic, index: tag.index)
+            }
+            throw error
+        }
+
+        // Some generic/blank tags acknowledge 16-byte writes but only persist the first 4 bytes.
+        // Verify and force 4-byte page writes when the readback does not match the desired payload.
+        let readback = try await readPages(tagIndex: tag.index, startPage: 0x24)
+        if readback != payload {
+            if debugLoggingEnabled {
+                print("Write verify mismatch at page 0x24; forcing 4-byte page writes.")
+                print("Expected: \(hex(payload))")
+                print("Actual  : \(hex(readback))")
+            }
+            try await writePagesInChunks(tagIndex: tag.index, startPage: 0x24, data16: payload)
+        }
+
+        if !requireExistingVehicleTag {
+            await setTagPasswordBestEffort(mode: .automatic, index: tag.index)
+        }
+
+        await resolveNameForPad(pad: pad, signature: tag.signature)
     }
 
     private func resolveNameForPad(pad: Pad, signature: String) async {
         guard pad != .all else { return }
         do {
-            let info = try await readTagInfo(pad: pad)
+            let info = try await readTagInfo(pad: pad, signature: signature)
             let name: String
+            let world: String
             switch info.type {
             case .character:
                 let character = DimensionPadMetadata.getCharacterById(info.id)
                 let display = character?.name ?? String(info.id)
-                let world = character?.world ?? "Unknown"
-                name = "\(display) (\(world))"
+                world = character?.world ?? "Unknown"
+                name = display
             case .vehicle:
                 let vehicle = DimensionPadMetadata.getVehicleById(info.id)
                 let display = vehicle?.name ?? String(info.id)
-                let world = vehicle?.world ?? "Unknown"
-                name = "\(display) (\(world))"
+                world = vehicle?.world ?? "Unknown"
+                name = display
             case .unknown:
                 return
             }
 
-            if pads[pad.rawValue]?.uid == signature {
-                publishPad(pad, present: true, uid: signature, name: name)
+            if pad == .center {
+                if pads.center.uid == signature {
+                    publishPad(pad, present: true, uid: signature, characterID: info.id, name: name, world: world)
+                }
+            } else if containsUid(signature, in: pad) {
+                publishPad(pad, present: true, uid: signature, characterID: info.id, name: name, world: world)
             }
         } catch {
             // ignore read failures
         }
     }
 
-    private func publishPad(_ pad: Pad, present: Bool, uid: String?, name: String?) {
-        pads[pad.rawValue] = PadState(present: present, uid: uid, name: name)
+    private func publishPad(_ pad: Pad, present: Bool, uid: String?, characterID: Int?, name: String?, world: String?) {
+        var next = pads
+        switch pad {
+        case .center:
+            next.center = PadState(present: present, uid: uid, characterID: characterID, name: name, world: world)
+        case .left:
+            updateSet(&next.left, present: present, uid: uid, characterID: characterID, name: name, world: world)
+        case .right:
+            updateSet(&next.right, present: present, uid: uid, characterID: characterID, name: name, world: world)
+        case .all:
+            break
+        }
+        pads = next
+    }
+
+    private func updateSet(_ set: inout Set<PadState>, present: Bool, uid: String?, characterID: Int?, name: String?, world: String?) {
+        guard let uid else {
+            if !present {
+                set.removeAll()
+            }
+            return
+        }
+
+        set = set.filter { $0.uid != uid }
+        if present {
+            set.insert(PadState(present: true, uid: uid, characterID: characterID, name: name, world: world))
+        }
+    }
+
+    private func containsUid(_ uid: String, in pad: Pad) -> Bool {
+        switch pad {
+        case .left:
+            return pads.left.contains { $0.uid == uid }
+        case .right:
+            return pads.right.contains { $0.uid == uid }
+        case .center:
+            return pads.center.uid == uid
+        case .all:
+            return false
+        }
+    }
+
+    private func firstTag(for pad: Pad) -> PresentTag? {
+        return presentTagBySlot.first { $0.key.pad == pad }?.value
+    }
+
+    private func tagFor(pad: Pad, signature: String) -> PresentTag? {
+        return presentTagBySlot.first { $0.key.pad == pad && $0.value.signature == signature }?.value
+    }
+
+    private func tags(for pad: Pad) -> [PresentTag] {
+        presentTagBySlot
+            .filter { $0.key.pad == pad }
+            .map(\.value)
+    }
+
+    private func resolveTagForWrite(pad: Pad, signature: String?) throws -> PresentTag {
+        if let signature {
+            guard let tag = tagFor(pad: pad, signature: signature) else {
+                throw ToyPadReadError.tagNotPresent
+            }
+            return tag
+        }
+
+        let entries = tags(for: pad)
+        guard !entries.isEmpty else {
+            throw ToyPadReadError.tagNotPresent
+        }
+        guard entries.count == 1 else {
+            throw ToyPadReadError.ambiguousTagSelection
+        }
+        return entries[0]
+    }
+
+    private func parseTagList(_ payload: [UInt8]) -> [(Pad, UInt8)] {
+        var results: [(Pad, UInt8)] = []
+        var i = 0
+        while i + 1 < payload.count {
+            let padIndex = payload[i]
+            let tagType = payload[i + 1]
+            i += 2
+
+            if padIndex == 0 { continue }
+            let padNum = padIndex >> 4
+            let index = padIndex & 0x0F
+            guard let pad = Pad(rawValue: padNum) else { continue }
+            if tagType != 0x00 { continue }
+            results.append((pad, index))
+        }
+        return results
     }
 
     private func deviceMatched(_ dev: IOHIDDevice) async {
@@ -214,9 +399,11 @@ public final class DimensionPad {
         // New USB session → reset protocol state
         msgCounter = 0x00
         pending55.removeAll()
-        presentTagByPad.removeAll()
+        presentTagBySlot.removeAll()
         
-        print("Device matched: \((IOHIDDeviceGetProperty(dev,  kIOHIDProductKey as CFString) as? String) ?? "-")")
+        if debugLoggingEnabled {
+            print("Device matched: \((IOHIDDeviceGetProperty(dev,  kIOHIDProductKey as CFString) as? String) ?? "-")")
+        }
 
         let r = IOHIDDeviceOpen(dev, IOOptionBits(kIOHIDOptionsTypeNone))
         guard r == kIOReturnSuccess else {
@@ -247,18 +434,27 @@ public final class DimensionPad {
 
         IOHIDDeviceScheduleWithRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
-        print("Input callback registered + INIT sent.")
+        Task { @MainActor in
+            await self.refreshPresentTagsFromList()
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            await self.refreshPresentTagsFromList()
+        }
+
+        if debugLoggingEnabled {
+            print("Input callback registered + INIT sent.")
+        }
     }
 
     private func deviceRemoved(_ dev: IOHIDDevice) {
         if let current = device, CFEqual(current, dev) {
-            let pendingContinuations = pending55.values
-            pending55.removeAll()
+            cancelPendingRequests()
             device = nil
             connected = false
-            print("Device removed.")
-            for pending in pendingContinuations {
-                pending.continuation.resume(throwing: ToyPadReadError.notConnected)
+            resetPads()
+            if debugLoggingEnabled {
+                print("Device removed.")
             }
         }
     }
@@ -267,7 +463,54 @@ public final class DimensionPad {
         bytes.withUnsafeBytes { raw in
             let ptr = raw.bindMemory(to: UInt8.self).baseAddress!
             let r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, reportID, ptr, bytes.count)
-            print(r == kIOReturnSuccess ? "OUT ✅ \(bytes.count) bytes" : "OUT ❌ \(r)")
+            if debugLoggingEnabled {
+                print(r == kIOReturnSuccess ? "OUT ✅ \(bytes.count) bytes" : "OUT ❌ \(r)")
+            }
+        }
+    }
+
+    private func refreshPresentTagsFromList() async {
+        guard let dev = self.device else { return }
+        for attempt in 0..<4 {
+            do {
+                let msg = try nextMsgAvailable()
+                let payload = try await request55(
+                    kind: .tagList,
+                    dev: dev,
+                    cmd: createTagListCommand(msg: msg)
+                )
+
+                let entries = parseTagList(payload)
+                if entries.isEmpty && attempt < 3 {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    continue
+                }
+
+                for (pad, index) in entries {
+                    let tagIndex = index
+                    let data16 = try await readPages(tagIndex: tagIndex, startPage: 0x00)
+                    guard data16.count >= 8 else { continue }
+                    let uid: [UInt8] = [data16[0], data16[1], data16[2], data16[4], data16[5], data16[6], data16[7]]
+                    let signature = signatureString(uid)
+                    let key = TagSlotKey(pad: pad, index: tagIndex)
+
+                    if presentTagBySlot[key]?.signature != signature {
+                        presentTagBySlot[key] = PresentTag(uid: uid, signature: signature, index: tagIndex)
+                        publishPad(pad, present: true, uid: signature, characterID: nil, name: nil, world: nil)
+                        Task { @MainActor in
+                            await resolveNameForPad(pad: pad, signature: signature)
+                        }
+                        events.send(TagEvent(action: .add, pad: pad, signature: signature, index: tagIndex, uid: uid))
+                    }
+                }
+                break
+            } catch {
+                if attempt < 3 {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    continue
+                }
+                break
+            }
         }
     }
 
@@ -299,7 +542,9 @@ public final class DimensionPad {
         let action = b[5]
         let uid = Array(b[6...12]) // 7 bytes
 
-        print("TAG \(hex(b))")
+        if debugLoggingEnabled {
+            print("TAG \(hex(b))")
+        }
 
         return TagEv(pad: pad, index: index, action: action, uid: uid)
     }
@@ -310,10 +555,13 @@ public final class DimensionPad {
         switch ev.action {
         case 0: // inserted
             // Only log/publish if this is a new UID for that pad
-            if presentTagByPad[ev.pad.rawValue]?.signature != signature {
-                presentTagByPad[ev.pad.rawValue] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
-                print("✅ \(ev.pad.rawValue) inserted uid=\(signature)")
-                publishPad(ev.pad, present: true, uid: signature, name: nil)
+            let key = TagSlotKey(pad: ev.pad, index: ev.index)
+            if presentTagBySlot[key]?.signature != signature {
+                presentTagBySlot[key] = PresentTag(uid: ev.uid, signature: signature, index: ev.index)
+                if debugLoggingEnabled {
+                    print("✅ \(ev.pad.rawValue) inserted uid=\(signature)")
+                }
+                publishPad(ev.pad, present: true, uid: signature, characterID: nil, name: nil, world: nil)
                 Task { @MainActor in
                     await resolveNameForPad(pad: ev.pad, signature: signature)
                 }
@@ -322,10 +570,13 @@ public final class DimensionPad {
 
         case 1: // removed
             // Only log/publish if something was present
-            if let removed = presentTagByPad[ev.pad.rawValue] {
-                presentTagByPad[ev.pad.rawValue] = nil
-                print("❌ \(ev.pad.rawValue) removed")
-                publishPad(ev.pad, present: false, uid: nil, name: nil)
+            let key = TagSlotKey(pad: ev.pad, index: ev.index)
+            if let removed = presentTagBySlot[key] {
+                presentTagBySlot[key] = nil
+                if debugLoggingEnabled {
+                    print("❌ \(ev.pad.rawValue) removed")
+                }
+                publishPad(ev.pad, present: false, uid: removed.signature, characterID: nil, name: nil, world: nil)
                 events.send(TagEvent(action: .remove, pad: ev.pad, signature: removed.signature, index: removed.index, uid: removed.uid))
             }
 
@@ -399,7 +650,9 @@ public final class DimensionPad {
         }
 
         // Debug what we actually got (helps when status != 0 or payload is short)
-        print("IN55 len=\(len) msg=\(frame.msg) payloadLen=\(frame.payload.count) payload=\(hex(frame.payload))")
+        if debugLoggingEnabled {
+            print("IN55 len=\(len) msg=\(frame.msg) payloadLen=\(frame.payload.count) payload=\(hex(frame.payload))")
+        }
 
         switch pending.kind {
         case .other:
@@ -426,27 +679,111 @@ public final class DimensionPad {
             let data16 = Array(frame.payload[1..<(1 + 16)])
             pending.continuation.resume(returning: data16)
             return true
+
+        case .tagList:
+            pending.continuation.resume(returning: frame.payload)
+            return true
         }
     }
     
-    private func readPages(padByte: UInt8, startPage: UInt8) async throws -> [UInt8] {
+    private func readPages(tagIndex: UInt8, startPage: UInt8) async throws -> [UInt8] {
         guard let dev = self.device else { throw ToyPadReadError.notConnected }
+        let msg = try nextMsgAvailable()
+        if debugLoggingEnabled {
+            print("D2 READ msg=\(msg) index=\(tagIndex) page=\(String(format:"%02X", startPage))")
+        }
 
-        guard let tag = presentTagByPad[padByte] else { throw ToyPadReadError.tagNotPresent }
-        let index = tag.index
-        let msg = nextMsg()
-        print("D2 READ msg=\(msg) pad=\(padByte) index=\(index) page=\(String(format:"%02X", startPage))")
-
-        // cmd: 55 04 D2 <msg> <index> <page>
         let data16 = try await request55(
             kind: .readPages,
             dev: dev,
-            cmd: createReadTagCommand(msg: msg, index: index, page: startPage)
+            cmd: createReadTagCommand(msg: msg, index: tagIndex, page: startPage)
         )
 
-        // handle55Response(.readPages) liefert bereits nur die 16 Datenbytes
         guard data16.count == 16 else { throw ToyPadReadError.malformedResponse }
         return data16
+    }
+
+    private func writePages(tagIndex: UInt8, startPage: UInt8, data16: [UInt8]) async throws {
+        guard let dev = self.device else { throw ToyPadReadError.notConnected }
+        guard data16.count == 16 else { throw ToyPadReadError.invalidWriteDataLength }
+        let msg = try nextMsgAvailable()
+        if debugLoggingEnabled {
+            print("D3 WRITE msg=\(msg) index=\(tagIndex) page=\(String(format:"%02X", startPage)) data=\(hex(data16))")
+        }
+
+        do {
+            let payload = try await request55(
+                kind: .other,
+                dev: dev,
+                cmd: createWriteTagCommand(msg: msg, index: tagIndex, page: startPage, data16: data16)
+            )
+
+            guard let status = payload.first else { throw ToyPadReadError.malformedResponse }
+            guard status == 0 else { throw ToyPadReadError.deviceError(status: status) }
+        } catch ToyPadReadError.deviceError(let status) where status == 0xF2 {
+            // Compatibility fallback: some tags only accept 4-byte Ultralight writes.
+            try await writePagesInChunks(tagIndex: tagIndex, startPage: startPage, data16: data16)
+        }
+    }
+
+    private func writePagesInChunks(tagIndex: UInt8, startPage: UInt8, data16: [UInt8]) async throws {
+        guard let dev = self.device else { throw ToyPadReadError.notConnected }
+        guard data16.count == 16 else { throw ToyPadReadError.invalidWriteDataLength }
+
+        for chunkIndex in 0..<4 {
+            let offset = chunkIndex * 4
+            let page = startPage &+ UInt8(chunkIndex)
+            let chunk = Array(data16[offset..<(offset + 4)])
+            let msg = try nextMsgAvailable()
+            if debugLoggingEnabled {
+                print("D3 WRITE(4B) msg=\(msg) index=\(tagIndex) page=\(String(format:"%02X", page)) data=\(hex(chunk))")
+            }
+
+            let payload = try await request55(
+                kind: .other,
+                dev: dev,
+                cmd: createWriteTagCommand4(msg: msg, index: tagIndex, page: page, data4: chunk)
+            )
+
+            guard let status = payload.first else { throw ToyPadReadError.malformedResponse }
+            guard status == 0 else { throw ToyPadReadError.deviceError(status: status) }
+        }
+    }
+
+    private func setTagPassword(mode: PortalPasswordMode, index: UInt8, customPassword: [UInt8] = [0, 0, 0, 0]) async throws {
+        guard let dev = self.device else { throw ToyPadReadError.notConnected }
+        guard customPassword.count == 4 else { throw ToyPadReadError.invalidPasswordLength }
+        let msg = try nextMsgAvailable()
+
+        let payload = try await request55(
+            kind: .other,
+            dev: dev,
+            cmd: createSetTagPasswordCommand(msg: msg, mode: mode.rawValue, index: index, customPassword: customPassword)
+        )
+
+        guard let status = payload.first else { throw ToyPadReadError.malformedResponse }
+        if status == 0 {
+            return
+        }
+        // Some portals/tags reject switching back to automatic password mode even after a successful write.
+        // Treat this as non-fatal so blank-tag initialization can proceed.
+        if mode == .automatic, status == 0xF0 {
+            if debugLoggingEnabled {
+                print("E1 automatic returned F0 on index \(index); continuing.")
+            }
+            return
+        }
+        throw ToyPadReadError.deviceError(status: status)
+    }
+
+    private func setTagPasswordBestEffort(mode: PortalPasswordMode, index: UInt8) async {
+        do {
+            try await setTagPassword(mode: mode, index: index)
+        } catch {
+            if debugLoggingEnabled {
+                print("E1 \(mode.rawValue) best-effort failed on index \(index): \(error)")
+            }
+        }
     }
 
     /// Send a 0x55 command frame and await the 0x55 response payload (without checksum).
@@ -457,6 +794,10 @@ public final class DimensionPad {
         guard pending55[msg] == nil else { throw ToyPadReadError.busy }
 
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[UInt8], Error>) in
+            if pending55[msg] != nil {
+                cont.resume(throwing: ToyPadReadError.malformedResponse)
+                return
+            }
             pending55[msg] = Pending55(kind: kind, continuation: cont)
             sendCommand(dev, cmd)
 
@@ -469,13 +810,26 @@ public final class DimensionPad {
         }
     }
 
+    private func cancelPendingRequests() {
+        let pending = pending55
+        pending55.removeAll()
+        for (_, item) in pending {
+            item.continuation.resume(throwing: ToyPadReadError.notConnected)
+        }
+    }
+
+    private func resetPads() {
+        presentTagBySlot.removeAll()
+        pads = PadSlots(center: PadState(present: false, uid: nil, characterID: nil, name: nil, world: nil))
+    }
+
     private func switchPad(_ dev: IOHIDDevice, pad: Pad, r: UInt8, g: UInt8, b: UInt8) {
         // 0x55 0x06 0xC0 0x02 = "switch pad color"
         // then: pad, R, G, B
         sendCommand(dev, [0x55, 0x06, 0xC0, 0x02, pad.rawValue, r, g, b])
     }
 
-    private func sendCommand(_ dev: IOHIDDevice, _ cmd: [UInt8]) {
+    func sendCommand(_ dev: IOHIDDevice, _ cmd: [UInt8]) {
         var message = cmd
         message.append(checksum(cmd))        // add checksum byte
 
@@ -485,10 +839,12 @@ public final class DimensionPad {
         message.withUnsafeBytes { raw in
             let ptr = raw.bindMemory(to: UInt8.self).baseAddress!
             let r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, 0, ptr, message.count)
-            if r == kIOReturnSuccess {
-                print("⬆️ OUT \(message.count) bytes cmd=\(cmd.map{String(format:"%02X",$0)}.joined(separator:" "))")
-            } else {
-                print("IOHIDDeviceSetReport failed: \(r)")
+            if debugLoggingEnabled {
+                if r == kIOReturnSuccess {
+                    print("⬆️ OUT \(message.count) bytes cmd=\(cmd.map{String(format:"%02X",$0)}.joined(separator:" "))")
+                } else {
+                    print("IOHIDDeviceSetReport failed: \(r)")
+                }
             }
         }
     }
@@ -506,10 +862,24 @@ public final class DimensionPad {
         [0x55, 0x04, 0xD2, msg, index, page]
     }
 
-    private func createSetColorCommand(msg: UInt8, pad: UInt8, r: UInt8, g: UInt8, b: UInt8) -> [UInt8] {
-        [0x55, 0x06, 0xC0, msg, pad, r, g, b]
+    private func createWriteTagCommand(msg: UInt8, index: UInt8, page: UInt8, data16: [UInt8]) -> [UInt8] {
+        var cmd: [UInt8] = [0x55, 0x14, 0xD3, msg, index, page]
+        cmd.append(contentsOf: data16)
+        return cmd
     }
-    
+
+    private func createWriteTagCommand4(msg: UInt8, index: UInt8, page: UInt8, data4: [UInt8]) -> [UInt8] {
+        var cmd: [UInt8] = [0x55, 0x08, 0xD3, msg, index, page]
+        cmd.append(contentsOf: data4)
+        return cmd
+    }
+
+    private func createSetTagPasswordCommand(msg: UInt8, mode: UInt8, index: UInt8, customPassword: [UInt8]) -> [UInt8] {
+        var cmd: [UInt8] = [0x55, 0x08, 0xE1, msg, mode, index]
+        cmd.append(contentsOf: customPassword)
+        return cmd
+    }
+
     // MARK: General Utilities
     
     private func hex(_ bytes: [UInt8]) -> String {
@@ -603,5 +973,72 @@ public final class DimensionPad {
             sum = sum &- delta
         }
         return (v0, v1)
+    }
+
+    private struct VehicleVariant {
+        let id: Int
+        let step: Int
+    }
+
+    private func resolveVehicleVariant(vehicleID: Int, step: Int?) throws -> VehicleVariant {
+        let all = DimensionPadMetadata.listVehicles()
+        guard !all.isEmpty else { throw ToyPadReadError.unknownVehicle }
+
+        if let step {
+            guard step >= 0 else { throw ToyPadReadError.invalidVehicleStep }
+            guard let selected = DimensionPadMetadata.getVehicleById(vehicleID) else {
+                throw ToyPadReadError.unknownVehicle
+            }
+            let rootID = selected.parentId ?? selected.id
+            let variants = all
+                .filter { $0.id == rootID || $0.parentId == rootID }
+                .sorted {
+                    let lhsBase = $0.id == rootID ? 0 : 1
+                    let rhsBase = $1.id == rootID ? 0 : 1
+                    if lhsBase != rhsBase { return lhsBase < rhsBase }
+                    return $0.id < $1.id
+                }
+
+            guard step < variants.count else { throw ToyPadReadError.invalidVehicleStep }
+            return VehicleVariant(id: variants[step].id, step: step)
+        }
+
+        guard let selected = DimensionPadMetadata.getVehicleById(vehicleID) else {
+            throw ToyPadReadError.unknownVehicle
+        }
+        let rootID = selected.parentId ?? selected.id
+        let variants = all
+            .filter { $0.id == rootID || $0.parentId == rootID }
+            .sorted {
+                let lhsBase = $0.id == rootID ? 0 : 1
+                let rhsBase = $1.id == rootID ? 0 : 1
+                if lhsBase != rhsBase { return lhsBase < rhsBase }
+                return $0.id < $1.id
+            }
+        let stepIndex = variants.firstIndex { $0.id == selected.id } ?? 0
+        return VehicleVariant(id: selected.id, step: stepIndex)
+    }
+
+    private func createVehiclePayload(vehicleID: Int, step: Int) -> [UInt8] {
+        let normalizedID = UInt32(clamping: vehicleID)
+        var payload = [UInt8](repeating: 0x00, count: 16)
+        payload[0] = UInt8(normalizedID & 0xFF)
+        payload[1] = UInt8((normalizedID >> 8) & 0xFF)
+        payload[2] = UInt8((normalizedID >> 16) & 0xFF)
+        payload[3] = UInt8((normalizedID >> 24) & 0xFF)
+        payload[9] = 0x01
+        payload[12] = upgradeFlag(step: step)
+        return payload
+    }
+
+    private func upgradeFlag(step: Int) -> UInt8 {
+        switch step {
+        case 1:
+            return 0x04
+        case 2:
+            return 0x08
+        default:
+            return 0x00
+        }
     }
 }

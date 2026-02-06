@@ -1,10 +1,10 @@
-# DimensionPad
+# ``DimensionPad``
 
 A Swift interface for the LEGO Dimensions Toy Pad over USB on macOS.
 
 ## Overview
 
-`DimensionPad` discovers and connects to a LEGO Dimensions Toy Pad, emits tag add/remove events, and can read tag data to decode character and vehicle IDs. It also provides a small metadata lookup layer that resolves IDs to names/worlds using bundled datasets.
+`DimensionPad` discovers and connects to a LEGO Dimensions Toy Pad, emits tag add/remove events, can read tag data to decode character and vehicle IDs, and supports writing tag blocks/vehicle payloads. It also provides a small metadata lookup layer that resolves IDs to names/worlds using bundled datasets.
 
 The most common flow is:
 1. Create a `DimensionPad` instance.
@@ -12,6 +12,7 @@ The most common flow is:
 3. Listen to `events` for tag add/remove.
 4. Call `readTagInfo(pad:)` to decode a tag.
 5. Maybe call setColor(pad:r:g:b:) to set a color in response
+6. Use `initializeBlankVehicle(pad:vehicleID:step:signature:)` for blank tags, or `writeVehicle(...)` for existing vehicle tags.
 
 ## Quick Start
 
